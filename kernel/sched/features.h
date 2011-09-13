@@ -46,11 +46,16 @@
  */
 #define SCHED_FEAT_NONTASK_CAPACITY 1
 
+#ifdef CONFIG_PREEMPT_RT_FULL
+#define SCHED_FEAT_TTWU_QUEUE 0
+#else
+
 /*
  * Queue remote wakeups on the target CPU and process them
  * using the scheduler IPI. Reduces rq->lock contention/bounces.
  */
 #define SCHED_FEAT_TTWU_QUEUE 0
+#endif
 
 /*
  * When doing wakeups, attempt to limit superfluous scans of the LLC domain.

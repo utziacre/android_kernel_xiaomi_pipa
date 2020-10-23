@@ -1161,7 +1161,7 @@ EXPORT_SYMBOL(rt_spin_lock_nested);
 void __lockfunc rt_spin_unlock(spinlock_t *lock)
 {
 	/* NOTE: we always pass in '1' for nested, for simplicity */
-	spin_release(&lock->dep_map, 1, _RET_IP_);
+	spin_release(&lock->dep_map, _RET_IP_);
 	migrate_enable();
 	rcu_read_unlock();
 	rt_spin_lock_fastunlock(&lock->lock, rt_spin_lock_slowunlock);
@@ -2049,22 +2049,6 @@ int __sched __rt_mutex_futex_trylock(struct rt_mutex *lock)
 	return __rt_mutex_slowtrylock(lock);
 }
 
-/**
- * rt_mutex_lock_killable - lock a rt_mutex killable
- *
- * @lock:              the rt_mutex to be locked
- * @detect_deadlock:   deadlock detection on/off
- *
- * Returns:
- *  0          on success
- * -EINTR      when interrupted by a signal
- */
-int __sched rt_mutex_lock_killable(struct rt_mutex *lock)
-{
-	return rt_mutex_lock_state(lock, 0, TASK_KILLABLE);
-}
-EXPORT_SYMBOL_GPL(rt_mutex_lock_killable);
-
 int __sched __rt_mutex_trylock(struct rt_mutex *lock)
 {
 #ifdef CONFIG_PREEMPT_RT_FULL
@@ -2538,7 +2522,7 @@ ww_mutex_lock_interruptible(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 	ret = rt_mutex_slowlock(&lock->base.lock, TASK_INTERRUPTIBLE, NULL, 0,
 				ctx);
 	if (ret)
-		mutex_release(&lock->base.dep_map, 1, _RET_IP_);
+		mutex_release(&lock->base.dep_map, _RET_IP_);
 	else if (!ret && ctx && ctx->acquired > 1)
 		return ww_mutex_deadlock_injection(lock, ctx);
 
@@ -2558,7 +2542,7 @@ ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
 	ret = rt_mutex_slowlock(&lock->base.lock, TASK_UNINTERRUPTIBLE, NULL, 0,
 				ctx);
 	if (ret)
-		mutex_release(&lock->base.dep_map, 1, _RET_IP_);
+		mutex_release(&lock->base.dep_map, _RET_IP_);
 	else if (!ret && ctx && ctx->acquired > 1)
 		return ww_mutex_deadlock_injection(lock, ctx);
 
@@ -2583,7 +2567,7 @@ void __sched ww_mutex_unlock(struct ww_mutex *lock)
 		lock->ctx = NULL;
 	}
 
-	mutex_release(&lock->base.dep_map, nest, _RET_IP_);
+	mutex_release(&lock->base.dep_map, _RET_IP_);
 	__rt_mutex_unlock(&lock->base.lock);
 }
 EXPORT_SYMBOL(ww_mutex_unlock);

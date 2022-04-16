@@ -9307,9 +9307,6 @@ static void migrate_disabled_sched(struct task_struct *p)
 	p->migrate_disable_scheduled = 1;
 }
 
-static DEFINE_PER_CPU(struct cpu_stop_work, migrate_work);
-static DEFINE_PER_CPU(struct migration_arg, migrate_arg);
-
 void migrate_enable(void)
 {
 	struct task_struct *p = current;

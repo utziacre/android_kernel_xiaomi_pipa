@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
@@ -23,6 +24,9 @@
 #include <linux/of_fdt.h>
 #include "governor.h"
 #include "governor_memlat.h"
+#include <linux/sched.h>
+#include <linux/smp.h>
+#include <soc/qcom/scm.h>
 #include <linux/perf_event.h>
 #include <linux/of_device.h>
 #include <linux/mutex.h>
@@ -146,6 +150,12 @@ struct memlat_mon_spec {
 	enum mon_type type;
 };
 
+struct memlat_ipi_data {
+	struct memlat_cpu_grp *cpu_grp;
+	struct completion done;
+	unsigned int cpu;
+};
+
 #define to_cpu_data(cpu_grp, cpu) \
 	(&cpu_grp->cpus_data[cpu - cpumask_first(&cpu_grp->cpus)])
 #define to_common_evs(cpu_grp, cpu) \
@@ -157,63 +167,144 @@ struct memlat_mon_spec {
 static struct workqueue_struct *memlat_wq;
 
 #define MAX_COUNT_LIM 0xFFFFFFFFFFFFFFFF
-static inline void read_event(struct event_data *event)
+/*
+ * Read a perf event on the CPU where it is scheduled.  In particular,
+ * do not use perf_event_read_value() here: it may send a synchronous IPI
+ * when the event belongs to another CPU.
+ */
+static void read_event(struct event_data *event)
 {
-	unsigned long ev_count = 0;
-	u64 total, enabled, running;
+	u64 total;
 
 	if (!event->pevent)
 		return;
 
-	total = perf_event_read_value(event->pevent, &enabled, &running);
-	ev_count = total - event->prev_count;
+	if (perf_event_read_local(event->pevent, &total, NULL, NULL))
+		return;
+
+	event->last_delta = total - event->prev_count;
 	event->prev_count = total;
-	event->last_delta = ev_count;
+}
+
+/*
+ * Read all common and monitor-specific events for one CPU.  One IPI
+ * therefore replaces the separate synchronous IPIs previously needed
+ * for each event.
+ */
+static void read_cpu_events(struct memlat_cpu_grp *cpu_grp, unsigned int cpu)
+{
+	struct cpu_data *cpu_data = to_cpu_data(cpu_grp, cpu);
+	struct event_data *common_evs = cpu_data->common_evs;
+	struct memlat_mon *mon;
+	unsigned int i;
+
+	for (i = 0; i < NUM_COMMON_EVS; i++)
+		read_event(&common_evs[i]);
+
+	if (!common_evs[STALL_IDX].pevent)
+		common_evs[STALL_IDX].last_delta =
+			common_evs[CYC_IDX].last_delta;
+
+	for (i = 0; i < cpu_grp->num_mons; i++) {
+		unsigned int mon_idx;
+
+		mon = &cpu_grp->mons[i];
+		if (!mon->is_active || !mon->miss_ev ||
+		    !cpumask_test_cpu(cpu, &mon->cpus))
+			continue;
+
+		mon_idx = cpu - cpumask_first(&mon->cpus);
+		read_event(&mon->miss_ev[mon_idx]);
+
+		if (mon->wb_ev_id && mon->access_ev_id) {
+			read_event(&mon->wb_ev[mon_idx]);
+			read_event(&mon->access_ev[mon_idx]);
+		}
+	}
+}
+
+static void read_cpu_events_ipi(void *info)
+{
+	struct memlat_ipi_data *ipd = info;
+
+	read_cpu_events(ipd->cpu_grp, ipd->cpu);
+	complete(&ipd->done);
 }
 
 static void update_counts(struct memlat_cpu_grp *cpu_grp)
 {
-	unsigned int cpu, i;
-	struct memlat_mon *mon;
+	struct memlat_ipi_data ipi_data[NR_CPUS];
+	call_single_data_t csd[NR_CPUS];
+	cpumask_t read_mask;
+	struct cpu_data *cpu_data;
+	struct event_data *common_evs;
 	ktime_t now = ktime_get();
-	unsigned long delta = ktime_us_delta(now, cpu_grp->last_update_ts);
+	unsigned long delta;
+	unsigned int cpu;
+	int this_cpu;
 
+	delta = ktime_us_delta(now, cpu_grp->last_update_ts);
 	cpu_grp->last_ts_delta_us = delta;
 	cpu_grp->last_update_ts = now;
 
+	cpumask_clear(&read_mask);
+
+	/*
+	 * Keep CPUs online while their asynchronous callbacks are pending.
+	 * Pin this task while reading its own CPU's events.
+	 */
+	cpus_read_lock();
+	migrate_disable();
+	this_cpu = raw_smp_processor_id();
+
 	for_each_cpu(cpu, &cpu_grp->cpus) {
-		struct cpu_data *cpu_data = to_cpu_data(cpu_grp, cpu);
-		struct event_data *common_evs = cpu_data->common_evs;
-
-		for (i = 0; i < NUM_COMMON_EVS; i++)
-			read_event(&common_evs[i]);
-
-		if (!common_evs[STALL_IDX].pevent)
-			common_evs[STALL_IDX].last_delta =
-				common_evs[CYC_IDX].last_delta;
-
-		cpu_data->freq = common_evs[CYC_IDX].last_delta / delta;
-		cpu_data->stall_pct = mult_frac(100,
-				common_evs[STALL_IDX].last_delta,
-				common_evs[CYC_IDX].last_delta);
-	}
-
-	for (i = 0; i < cpu_grp->num_mons; i++) {
-		mon = &cpu_grp->mons[i];
-
-		if (!mon->is_active || !mon->miss_ev)
+		if (!cpu_online(cpu) || under_scm_call(cpu))
 			continue;
 
-		for_each_cpu(cpu, &mon->cpus) {
-			unsigned int mon_idx =
-				cpu - cpumask_first(&mon->cpus);
-			read_event(&mon->miss_ev[mon_idx]);
-
-			if (mon->wb_ev_id && mon->access_ev_id) {
-				read_event(&mon->wb_ev[mon_idx]);
-				read_event(&mon->access_ev[mon_idx]);
-			}
+		if (cpu == this_cpu) {
+			cpumask_set_cpu(cpu, &read_mask);
+			continue;
 		}
+
+		ipi_data[cpu].cpu_grp = cpu_grp;
+		ipi_data[cpu].cpu = cpu;
+		init_completion(&ipi_data[cpu].done);
+		csd[cpu].flags = 0;
+
+		if (generic_exec_single(cpu, &csd[cpu],
+					read_cpu_events_ipi, &ipi_data[cpu]))
+			continue;
+
+		cpumask_set_cpu(cpu, &read_mask);
+	}
+
+	/* Read locally while remote CPUs process their events in parallel. */
+	if (cpumask_test_cpu(this_cpu, &read_mask))
+		read_cpu_events(cpu_grp, this_cpu);
+
+	migrate_enable();
+
+	/*
+	 * Wait for dispatched IPIs without spinning with preemption
+	 * disabled.  The callback must finish before the stack data goes
+	 * out of scope.
+	 */
+	for_each_cpu(cpu, &read_mask) {
+		if (cpu != this_cpu)
+			wait_for_completion(&ipi_data[cpu].done);
+	}
+	cpus_read_unlock();
+
+	/* Compute derived values only for CPUs with fresh counter readings. */
+	for_each_cpu(cpu, &read_mask) {
+		cpu_data = to_cpu_data(cpu_grp, cpu);
+		common_evs = cpu_data->common_evs;
+
+		cpu_data->freq = delta ?
+			common_evs[CYC_IDX].last_delta / delta : 0;
+		cpu_data->stall_pct = common_evs[CYC_IDX].last_delta ?
+			mult_frac(100, common_evs[STALL_IDX].last_delta,
+				  common_evs[CYC_IDX].last_delta) : 0;
 	}
 }
 
@@ -227,7 +318,7 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 	 * Some of SCM call is very heavy(+20ms) so perf IPI could
 	 * be stuck on the CPU which contributes long latency.
 	 */
-	if (under_scm_call())
+	if (under_scm_call(raw_smp_processor_id()))
 		return 0;
 
 	for_each_cpu(cpu, &mon->cpus) {

@@ -6813,11 +6813,11 @@ static inline int select_idle_sibling_cstate_aware(struct task_struct *p,
 
 			for_each_cpu_and(i, &p->cpus_allowed,
 					  sched_group_span(sg)) {
-				int idle_idx;
+				int idle_idx = -1;
 				unsigned long new_usage;
 				unsigned long capacity_orig;
 
-				if (!idle_cpu(i))
+				if (!(available_idle_cpu(i) || sched_idle_cpu(i)))
 					goto next;
 
 				/* figure out if the task can fit here at all */
@@ -6838,7 +6838,8 @@ static inline int select_idle_sibling_cstate_aware(struct task_struct *p,
 				/* otherwise select CPU with shallowest idle
 				 * state to reduce wakeup latency.
 				 */
-				idle_idx = idle_get_state_idx(cpu_rq(i));
+				if (available_idle_cpu(i) || sched_idle_cpu(i))
+					idle_idx = idle_get_state_idx(cpu_rq(i));
 
 				if (idle_idx < best_idle_cstate &&
 				    capacity_orig <= best_idle_capacity) {
@@ -7135,7 +7136,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	if (((capacity_orig_of(prev_cpu) == capacity_orig_of(start_cpu)) ||
 		asym_cap_siblings(prev_cpu, start_cpu)) &&
 		!cpu_isolated(prev_cpu) && cpu_online(prev_cpu) &&
-		idle_cpu(prev_cpu)) {
+		(available_idle_cpu(i) || sched_idle_cpu(i))) {
 
 		if (idle_get_state_idx(cpu_rq(prev_cpu)) <= 1) {
 			target_cpu = prev_cpu;
@@ -7221,7 +7222,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 			 */
 			spare_cap = capacity_orig - new_util;
 
-			if (idle_cpu(i))
+			if (available_idle_cpu(i) || sched_idle_cpu(i))
 				idle_idx = idle_get_state_idx(cpu_rq(i));
 
 
@@ -7263,7 +7264,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 				 * - for !boosted tasks: the most energy
 				 * efficient CPU (i.e. smallest capacity_orig)
 				 */
-				if (idle_cpu(i)) {
+				if (available_idle_cpu(i) || sched_idle_cpu(i)) {
 					if (boosted &&
 					    capacity_orig < target_capacity)
 						continue;
@@ -7357,7 +7358,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 			 * will take care to ensure the minimization of energy
 			 * consumptions without affecting performance.
 			 */
-			if (idle_cpu(i)) {
+			if (available_idle_cpu(i) || sched_idle_cpu(i)) {
 				/*
 				 * Prefer shallowest over deeper idle state cpu,
 				 * of same capacity cpus.
@@ -7523,7 +7524,8 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 
 	if (target_cpu == -1 && most_spare_cap_cpu != -1 &&
 		/* ensure we use active cpu for active migration */
-		!(p->state == TASK_RUNNING && !idle_cpu(most_spare_cap_cpu)))
+		!(p->state == TASK_RUNNING && !(available_idle_cpu(most_spare_cap_cpu)
+		|| sched_idle_cpu(most_spare_cap_cpu))))
 		target_cpu = most_spare_cap_cpu;
 
 	if (target_cpu == -1 && isolated_candidate != -1 &&
@@ -7988,7 +7990,9 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 
 	/* If there is only one sensible candidate, select it now. */
 	cpu = cpumask_first(candidates);
-	if (weight == 1 && ((uclamp_latency_sensitive(p) && idle_cpu(cpu)) ||
+	if (weight == 1 && ((uclamp_latency_sensitive(p) &&
+			    (available_idle_cpu(cpu) || 
+			    sched_idle_cpu(cpu))) ||
 			    (cpu == prev_cpu))) {
 		best_energy_cpu = cpu;
 		goto unlock;
@@ -8035,8 +8039,8 @@ unlock:
 	 * Pick the prev CPU, if best energy CPU can't saves at least 6% of
 	 * the energy used by prev_cpu.
 	 */
-	if (!(idle_cpu(best_energy_cpu) &&
-	    idle_get_state_idx(cpu_rq(best_energy_cpu)) <= 0) &&
+	if (!(sched_idle_cpu(best_energy_cpu) || (available_idle_cpu(best_energy_cpu) &&
+	    idle_get_state_idx(cpu_rq(best_energy_cpu)) <= 0)) &&
 	    (prev_energy != ULONG_MAX) && (best_energy_cpu != prev_cpu) &&
 	    ((prev_energy - best_energy) <= prev_energy >> 4))
 		best_energy_cpu = prev_cpu;

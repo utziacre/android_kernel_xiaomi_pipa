@@ -596,6 +596,7 @@ static void dsi_pll_setup_config(struct dsi_pll_7nm *pll,
 
 	if (pll->cphy_enabled) {
 		config->enable_ssc = false;
+		pr_info("[7nm] disable pll ssc %d\n", config->enable_ssc);
 	}
 
 	if (config->enable_ssc) {

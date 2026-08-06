@@ -421,7 +421,6 @@ struct msm_display_dsc_info {
 
 	u32 extra_width;
 	u32 pps_delay_ms;
-	u64 panel_id;
 };
 
 /**

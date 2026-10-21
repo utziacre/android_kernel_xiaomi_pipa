@@ -242,7 +242,6 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 static int cpu_map_kthread_run(void *data)
 {
 	struct bpf_cpu_map_entry *rcpu = data;
-	unsigned long last_qs = jiffies;
 
 	set_current_state(TASK_INTERRUPTIBLE);
 
@@ -266,12 +265,10 @@ static int cpu_map_kthread_run(void *data)
 			if (__ptr_ring_empty(rcpu->queue)) {
 				schedule();
 				sched = 1;
-				last_qs = jiffies;
 			} else {
 				__set_current_state(TASK_RUNNING);
 			}
 		} else {
-			rcu_softirq_qs_periodic(last_qs);
 			sched = cond_resched();
 		}
 

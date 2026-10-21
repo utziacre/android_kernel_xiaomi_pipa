@@ -477,11 +477,6 @@ restart:
 
 	__this_cpu_write(active_softirqs, 0);
 
-#ifndef CONFIG_PREEMPT_RT
-	if (__this_cpu_read(ksoftirqd) == current)
-		rcu_softirq_qs();
-#endif
-
 	pending = local_softirq_pending();
 	deferred = softirq_deferred_for_rt(pending);
 

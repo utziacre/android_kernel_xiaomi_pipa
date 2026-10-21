@@ -515,7 +515,7 @@ retry:
 	major |= fault & VM_FAULT_MAJOR;
 
 	/* Quick path to respond to signals */
-	if (fault_signal_pending(fault, regs)) {
+	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current)) {
 		if (!user_mode(regs))
 			goto no_context;
 		return 0;

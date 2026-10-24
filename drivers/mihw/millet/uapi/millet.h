@@ -2,7 +2,7 @@
 #define UAPI_MILLET_H
 
 #ifndef NETLINK_MILLET
-#define NETLINK_MILLET		29
+#define NETLINK_MILLET		31
 #endif
 
 #define MILLET_KERNEL_ID	0x12341234

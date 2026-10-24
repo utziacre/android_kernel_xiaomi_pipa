@@ -408,6 +408,9 @@ static inline void destroy_hrtimer_on_stack(struct hrtimer *timer) { }
 extern void hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 				   u64 range_ns, const enum hrtimer_mode mode);
 
+extern void hrtimer_sleeper_start_range_ns(struct hrtimer *timer, ktime_t tim,
+                                   u64 range_ns, const enum hrtimer_mode mode);
+
 /**
  * hrtimer_start - (re)start an hrtimer
  * @timer:	the timer to be added
@@ -436,6 +439,9 @@ static inline void hrtimer_start_expires(struct hrtimer *timer,
 	delta = ktime_to_ns(ktime_sub(hard, soft));
 	hrtimer_start_range_ns(timer, soft, delta, mode);
 }
+
+void hrtimer_sleeper_start_expires(struct hrtimer_sleeper *sl,
+				   enum hrtimer_mode mode);
 
 static inline void hrtimer_restart(struct hrtimer *timer)
 {

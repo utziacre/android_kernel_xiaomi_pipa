@@ -520,7 +520,7 @@ do {										\
 	hrtimer_init_sleeper_on_stack(&__t, CLOCK_MONOTONIC, HRTIMER_MODE_REL,	\
 				      current);					\
 	if ((timeout) != KTIME_MAX)						\
-		hrtimer_start_range_ns(&__t.timer, timeout,			\
+		hrtimer_sleeper_start_range_ns(&__t.timer, timeout,			\
 				       current->timer_slack_ns,			\
 				       HRTIMER_MODE_REL);			\
 										\

@@ -567,10 +567,16 @@ struct cfs_rq {
 	unsigned int		idle_h_nr_running;
 
 	u64			exec_clock;
-	u64			min_vruntime;
-#ifndef CONFIG_64BIT
-	u64			min_vruntime_copy;
-#endif
+	/*
+	 * Weighted average of tree vruntimes, tracked relative to
+	 * zero_vruntime:
+	 *
+	 *   sum_w_vruntime = \Sum (v_i - zero_vruntime) * w_i
+	 *   sum_weight     = \Sum w_i
+	 */
+	s64			sum_w_vruntime;
+	u64			sum_weight;
+	u64			zero_vruntime;
 
 	struct rb_root_cached	tasks_timeline;
 
@@ -1784,6 +1790,8 @@ extern const u32		sched_prio_to_wmult[40];
 #else
 #define ENQUEUE_MIGRATED	0x00
 #endif
+/* New entity, e.g. from fork */
+#define ENQUEUE_INITIAL		0x80
 
 #define RETRY_TASK		((void *)-1UL)
 
@@ -2423,8 +2431,10 @@ static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
 
 #endif
 
+extern struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq);
 extern struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq);
 extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
+extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 
 #ifdef	CONFIG_SCHED_DEBUG
 extern bool sched_debug_enabled;

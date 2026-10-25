@@ -139,3 +139,36 @@
  * RT class.
  */
 #define SCHED_FEAT_SCHEDTUNE_BOOST_HOLD_ALL 0
+
+/*
+ * EEVDF: preserve lag when placing entities.
+ */
+#define SCHED_FEAT_PLACE_LAG 1
+
+/*
+ * EEVDF: start new tasks with half a slice.
+ */
+#define SCHED_FEAT_PLACE_DEADLINE_INITIAL 1
+
+/*
+ * EEVDF: once selected, keep running a task until it runs to its
+ * deadline (or becomes ineligible).
+ */
+#define SCHED_FEAT_RUN_TO_PARITY 1
+
+/*
+ * EEVDF: allow a wakeup of a task with a shorter slice to cancel the
+ * RUN_TO_PARITY protection of the current task.
+ */
+#define SCHED_FEAT_PREEMPT_SHORT 1
+
+/*
+ * EEVDF: preserve the relative virtual deadline across 'migration'.
+ */
+#define SCHED_FEAT_PLACE_REL_DEADLINE 1
+
+/*
+ * Allow pick_eevdf() to select the ->next buddy, this affects latency
+ * but not fairness.
+ */
+#define SCHED_FEAT_PICK_BUDDY 1

@@ -156,6 +156,11 @@ lib-$(CONFIG_DECOMPRESS_XZ) += decompress_unxz.o
 lib-$(CONFIG_DECOMPRESS_LZO) += decompress_unlzo.o
 lib-$(CONFIG_DECOMPRESS_LZ4) += decompress_unlz4.o
 
+# decompress_unlz4.c includes lib/lz4/lz4_decompress.c and the vendored
+# upstream sources, which are C11.  The kernel default is gnu89.
+CFLAGS_decompress_unlz4.o += -std=gnu11
+CFLAGS_decompress_unlz4.o += -I $(srctree)/lib/lz4/freestanding
+
 obj-$(CONFIG_TEXTSEARCH) += textsearch.o
 obj-$(CONFIG_TEXTSEARCH_KMP) += ts_kmp.o
 obj-$(CONFIG_TEXTSEARCH_BM) += ts_bm.o

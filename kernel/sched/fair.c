@@ -4538,10 +4538,62 @@ bias_to_this_cpu(struct task_struct *p, int cpu, int start_cpu)
 	return base_test && start_cap_test;
 }
 
+/*
+ * Check whether a task with @util can fit on @cpu, taking the uclamp
+ * restrictions into account. @capacity is the capacity to compare against
+ * and @margin the migration margin to use.
+ *
+ * Mirrors upstream util_fits_cpu(): a task always fits if its uclamp_max is
+ * below the CPU's original capacity, while a task boosted by uclamp_min only
+ * fits if the CPU can provide that minimum capacity without relying on the
+ * migration margin/capacity pressure.
+ */
+static inline int util_fits_cpu(unsigned long util, unsigned long uclamp_min,
+				unsigned long uclamp_max, unsigned long capacity,
+				unsigned int margin, int cpu)
+{
+	unsigned long capacity_orig = capacity_orig_of(cpu);
+	bool fits, uclamp_max_fits;
+
+	/*
+	 * Check if the real util fits without any uclamp boost/cap applied.
+	 */
+	fits = capacity * 1024 > util * margin;
+
+	if (!uclamp_is_used())
+		return fits;
+
+	/*
+	 * We want to force a task to fit a cpu as implied by uclamp_max, but
+	 * not when both the CPU and the task are at max capacity, so that the
+	 * overutilized state is not blocked.
+	 */
+	uclamp_max_fits = (capacity_orig == SCHED_CAPACITY_SCALE) &&
+			  (uclamp_max == SCHED_CAPACITY_SCALE);
+	uclamp_max_fits = !uclamp_max_fits && (uclamp_max <= capacity_orig);
+	fits = fits || uclamp_max_fits;
+
+	/*
+	 * If the task is boosted by uclamp_min beyond its util, it must be able
+	 * to get that minimum performance level from this CPU without relying
+	 * on the migration margin/pressure.
+	 *
+	 * Also make sure uclamp_min > uclamp_max is handled.
+	 */
+	uclamp_min = min(uclamp_min, uclamp_max);
+	if (util < uclamp_min && capacity_orig != SCHED_CAPACITY_SCALE)
+		fits = fits && (uclamp_min <= capacity_orig);
+
+	return fits;
+}
+
 static inline bool task_fits_capacity(struct task_struct *p,
 					long capacity,
 					int cpu)
 {
+	unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
+	unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
+	unsigned long util = task_util_est(p);
 	unsigned int margin;
 
 	/*
@@ -4553,7 +4605,8 @@ static inline bool task_fits_capacity(struct task_struct *p,
 	else
 		margin = sched_capacity_margin_up[task_cpu(p)];
 
-	return capacity * 1024 > uclamp_task_util(p) * margin;
+	return util_fits_cpu(util, uclamp_min, uclamp_max, capacity,
+			     margin, cpu) > 0;
 }
 
 static inline bool task_fits_max(struct task_struct *p, int cpu)
@@ -8248,6 +8301,9 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 		max_spare_cap = 0;
 
 		for_each_cpu_and(cpu, perf_domain_span(pd), sched_domain_span(sd)) {
+			unsigned long util_min = 0;
+			unsigned long util_max = SCHED_CAPACITY_SCALE;
+
 			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
 				continue;
 
@@ -8261,11 +8317,25 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 			 * overutilized. Take uclamp into account to see how
 			 * much capacity we can get out of the CPU; this is
 			 * aligned with schedutil_cpu_util().
+			 *
+			 * Open code uclamp_rq_util_with() except for the
+			 * clamp() part: util_fits_cpu() needs the raw util
+			 * plus the max-aggregated uclamp_{min, max}.
 			 */
-			util = uclamp_rq_util_with(cpu_rq(cpu), util, p);
+			if (uclamp_is_used()) {
+				if (uclamp_rq_is_idle(cpu_rq(cpu))) {
+					util_min = uclamp_eff_value(p, UCLAMP_MIN);
+					util_max = uclamp_eff_value(p, UCLAMP_MAX);
+				} else {
+					util_min = max(uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN),
+						       uclamp_eff_value(p, UCLAMP_MIN));
+					util_max = max(uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX),
+						       uclamp_eff_value(p, UCLAMP_MAX));
+				}
+			}
 
-			if (cpu_cap * 1024 <
-					util * sched_capacity_margin_up[cpu])
+			if (!util_fits_cpu(util, util_min, util_max, cpu_cap,
+					   sched_capacity_margin_up[cpu], cpu))
 				continue;
 
 			/*

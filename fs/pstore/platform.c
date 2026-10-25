@@ -185,7 +185,7 @@ static int zbufsize_lzo(size_t size)
 #if IS_ENABLED(CONFIG_PSTORE_LZ4_COMPRESS) || IS_ENABLED(CONFIG_PSTORE_LZ4HC_COMPRESS)
 static int zbufsize_lz4(size_t size)
 {
-	return LZ4_compressBound(size);
+	return LZ4_COMPRESSBOUND(size);
 }
 #endif
 

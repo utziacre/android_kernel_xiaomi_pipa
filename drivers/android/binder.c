@@ -4745,8 +4745,14 @@ static int binder_wait_for_work(struct binder_thread *thread,
 		if (do_proc_work)
 			list_add(&thread->waiting_thread_node,
 				 &proc->waiting_threads);
-		trace_android_vh_binder_wait_for_work(do_proc_work, thread, proc);
+		/*
+		 * Call the vendor hook without holding proc->inner_lock:
+		 * vendor code must not take t->lock under inner_lock (binder
+		 * core uses the opposite order) and this keeps the sleeping
+		 * lock out of the hook's critical section on PREEMPT_RT.
+		 */
 		binder_inner_proc_unlock(proc);
+		trace_android_vh_binder_wait_for_work(do_proc_work, thread, proc);
 		schedule();
 		binder_inner_proc_lock(proc);
 		list_del_init(&thread->waiting_thread_node);

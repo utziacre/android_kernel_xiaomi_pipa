@@ -7289,6 +7289,22 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 			nr = 4;
 	}
 
+        if (sched_feat(SIS_UTIL)) {
+		struct sched_domain_shared *sd_share;
+
+		sd_share = rcu_dereference(per_cpu(sd_llc_shared, target));
+		if (sd_share) {
+			/*
+			 * nr_idle_scan follows the LLC's headroom: 0 means the
+			 * domain is saturated and the scan is skipped, which is
+			 * the common case for a wakeup on a busy system.
+			 */
+			nr = min(nr, READ_ONCE(sd_share->nr_idle_scan) + 1);
+			if (nr <= 1)
+				return -1;
+		}
+	}
+
 	time = local_clock();
 
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
@@ -7301,7 +7317,6 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
 			break;
 	}
-
 	time = local_clock() - time;
 	cost = this_sd->avg_scan_cost;
 	delta = (s64)(time - cost) / 8;
@@ -8809,6 +8824,29 @@ static void set_next_buddy(struct sched_entity *se)
 /*
  * Preempt the current task with a newly woken task if needed:
  */
+/*
+ * Classic (pre EEVDF) wakeup preemption rule: preempt current when the
+ * wakee's virtual runtime is far enough ahead of it. Unlike the EEVDF pick
+ * based rule this does not require the wakee to be eligible, so a task that
+ * was placed slightly behind the average can still preempt.
+ */
+static int wakeup_preempt_entity(struct sched_entity *curr,
+				 struct sched_entity *se)
+{
+	s64 gran, vdiff = curr->vruntime - se->vruntime;
+
+	if (vdiff <= 0)
+		return -1;
+
+	gran = calc_delta_fair(mult_frac(se->slice,
+					 sysctl_sched_wakeup_preempt_gran, 1024),
+			       se);
+	if (vdiff > gran)
+		return 1;
+
+	return 0;
+}
+
 static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
 {
 	struct task_struct *curr = rq->curr;
@@ -8884,6 +8922,14 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	 */
 	if (sched_feat(NEXT_BUDDY) && !preempt_short && !(wake_flags & WF_FORK))
 		set_next_buddy(pse);
+
+	if (sysctl_sched_wakeup_preempt_gran) {
+		if (wakeup_preempt_entity(se, pse) == 1)
+			goto preempt;
+
+		/* The classic rule says no, skip the stricter EEVDF check */
+		goto update;
+	}
 
 	if (pick_next_entity(cfs_rq, !preempt_short) == pse)
 		goto preempt;
@@ -10002,6 +10048,45 @@ struct sd_lb_stats {
 	struct sg_lb_stats local_stat;	/* Statistics of the local group */
 };
 
+/*
+ * SIS_UTIL: translate the utilization of the domain seen by load balancing
+ * into a bound for the idle CPU scan of select_idle_cpu(). A saturated
+ * domain is not scanned at all, an idle one gets the full span.
+ */
+static void update_idle_cpu_scan(struct lb_env *env, unsigned long sum_util)
+{
+	struct sched_domain_shared *sd_share;
+	int llc_weight;
+	unsigned long spare;
+	u64 nr;
+
+	if (!sched_feat(SIS_UTIL) || env->idle == CPU_NEWLY_IDLE)
+		return;
+
+	llc_weight = per_cpu(sd_llc_size, env->dst_cpu);
+	if (env->sd->span_weight != llc_weight)
+		return;
+
+	sd_share = rcu_dereference(per_cpu(sd_llc_shared, env->dst_cpu));
+	if (!sd_share)
+		return;
+
+	/*
+	 * sum_util is in [0, llc_weight << SCHED_CAPACITY_SHIFT]. Allow twice
+	 * as many steps as there are idle CPUs worth of capacity left, so a
+	 * scattered idle CPU is still reached, and stop scanning completely
+	 * once the domain is saturated.
+	 */
+	spare = (unsigned long)llc_weight << SCHED_CAPACITY_SHIFT;
+	if (sum_util >= spare)
+		nr = 0;
+	else
+		nr = min_t(u64, (u64)(spare - sum_util) * 2 /
+				   SCHED_CAPACITY_SCALE, llc_weight);
+
+	WRITE_ONCE(sd_share->nr_idle_scan, (int)nr);
+}
+
 static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
 {
 	/*
@@ -10645,6 +10730,8 @@ next_group:
 			   jiffies + msecs_to_jiffies(LOAD_AVG_PERIOD));
 	}
 #endif
+
+	update_idle_cpu_scan(env, sds->total_util);
 
 	if (env->sd->flags & SD_NUMA)
 		env->fbq_type = fbq_classify_group(&sds->busiest_stat);

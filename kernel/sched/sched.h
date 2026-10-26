@@ -75,6 +75,10 @@
 
 #include "cpupri.h"
 #include "cpudeadline.h"
+
+/* Runtime switch used by features.h for SCHED_FEAT_PLACE_LAG */
+extern unsigned int sysctl_sched_place_lag;
+
 #include "features.h"
 
 #ifdef CONFIG_SCHED_DEBUG

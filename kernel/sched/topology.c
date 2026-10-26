@@ -1774,6 +1774,12 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
 			if (!sds)
 				return -ENOMEM;
 
+			/*
+			 * SIS_UTIL: start with an unbounded idle scan and let
+			 * load balancing narrow it down as the domain fills up.
+			 */
+			sds->nr_idle_scan = nr_cpu_ids;
+
 			*per_cpu_ptr(sdd->sds, j) = sds;
 
 			sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),

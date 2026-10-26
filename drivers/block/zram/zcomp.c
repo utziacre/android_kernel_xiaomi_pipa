@@ -17,6 +17,7 @@
 #include <linux/crypto.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
+#include <linux/mm.h>
 #include <linux/lzo.h>
 #include <linux/lz4.h>
 #if IS_ENABLED(CONFIG_ZSTD_COMPRESS)
@@ -59,20 +60,20 @@ struct zcomp_ops {
 			  void *dst, unsigned int *dlen);
 };
 
+static void kvfree_ctx(void *ctx)
+{
+	kvfree(ctx);
+}
+
 #if IS_ENABLED(CONFIG_LZ4_COMPRESS)
 static unsigned int zram_lz4_acceleration = 1;
 module_param(zram_lz4_acceleration, uint, 0644);
 MODULE_PARM_DESC(zram_lz4_acceleration,
 		 "zram LZ4 acceleration factor (1 = default)");
 
-static void vfree_ctx(void *ctx)
-{
-	vfree(ctx);
-}
-
 static void *lz4_create_cctx(const char *name)
 {
-	return vmalloc(LZ4_MEM_COMPRESS);
+	return kvmalloc(LZ4_MEM_COMPRESS, GFP_KERNEL);
 }
 
 static int lz4_compress(void *ctx, const void *src, unsigned int slen,
@@ -110,7 +111,7 @@ static const struct zcomp_ops lz4_ops = {
 	.name		= "lz4",
 	.shared_decomp	= true,
 	.create_cctx	= lz4_create_cctx,
-	.destroy_ctx	= vfree_ctx,
+	.destroy_ctx	= kvfree_ctx,
 	.compress	= lz4_compress,
 	.decompress	= lz4_decompress,
 };
@@ -123,7 +124,7 @@ MODULE_PARM_DESC(zram_lz4hc_level, "zram LZ4HC level (3..9)");
 
 static void *lz4hc_create_cctx(const char *name)
 {
-	return vmalloc(LZ4HC_MEM_COMPRESS);
+	return kvmalloc(LZ4HC_MEM_COMPRESS, GFP_KERNEL);
 }
 
 static int lz4hc_compress(void *ctx, const void *src, unsigned int slen,
@@ -160,7 +161,7 @@ static const struct zcomp_ops lz4hc_ops = {
 	.name		= "lz4hc",
 	.shared_decomp	= true,
 	.create_cctx	= lz4hc_create_cctx,
-	.destroy_ctx	= vfree_ctx,
+	.destroy_ctx	= kvfree_ctx,
 	.compress	= lz4hc_compress,
 	.decompress	= lz4hc_decompress,
 };
@@ -169,7 +170,7 @@ static const struct zcomp_ops lz4hc_ops = {
 #if IS_ENABLED(CONFIG_LZO_COMPRESS)
 static void *lzo_create_cctx(const char *name)
 {
-	return vmalloc(LZO1X_MEM_COMPRESS);
+	return kvmalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
 }
 
 static int lzo_compress(void *ctx, const void *src, unsigned int slen,
@@ -204,7 +205,7 @@ static const struct zcomp_ops lzo_ops = {
 	.name		= "lzo",
 	.shared_decomp	= true,
 	.create_cctx	= lzo_create_cctx,
-	.destroy_ctx	= vfree_ctx,
+	.destroy_ctx	= kvfree_ctx,
 	.compress	= lzo_compress,
 	.decompress	= lzo_decompress,
 };
@@ -227,7 +228,7 @@ static const struct zcomp_ops lzorle_ops = {
 	.name		= "lzo-rle",
 	.shared_decomp	= true,
 	.create_cctx	= lzo_create_cctx,
-	.destroy_ctx	= vfree_ctx,
+	.destroy_ctx	= kvfree_ctx,
 	.compress	= lzorle_compress,
 	.decompress	= lzo_decompress,
 };
@@ -264,7 +265,7 @@ static void *zstd_create_cctx(const char *name)
 	if (!zctx)
 		return NULL;
 
-	zctx->cwksp = vzalloc(wksp_size);
+	zctx->cwksp = kvzalloc(wksp_size, GFP_KERNEL);
 	if (!zctx->cwksp)
 		goto error;
 
@@ -275,7 +276,7 @@ static void *zstd_create_cctx(const char *name)
 	return zctx;
 
 error:
-	vfree(zctx->cwksp);
+	kvfree(zctx->cwksp);
 	kfree(zctx);
 	return NULL;
 }
@@ -289,7 +290,7 @@ static void *zstd_create_dctx(const char *name)
 	if (!zctx)
 		return NULL;
 
-	zctx->dwksp = vzalloc(wksp_size);
+	zctx->dwksp = kvzalloc(wksp_size, GFP_KERNEL);
 	if (!zctx->dwksp)
 		goto error;
 
@@ -300,7 +301,7 @@ static void *zstd_create_dctx(const char *name)
 	return zctx;
 
 error:
-	vfree(zctx->dwksp);
+	kvfree(zctx->dwksp);
 	kfree(zctx);
 	return NULL;
 }
@@ -309,8 +310,8 @@ static void zstd_destroy_ctx(void *ctx)
 {
 	struct zstd_ctx *zctx = ctx;
 
-	vfree(zctx->cwksp);
-	vfree(zctx->dwksp);
+	kvfree(zctx->cwksp);
+	kvfree(zctx->dwksp);
 	kfree(zctx);
 }
 
@@ -378,8 +379,9 @@ static void *deflate_create_cctx(const char *name)
 	if (!ctx)
 		return NULL;
 
-	ctx->workspace = vzalloc(zlib_deflate_workspacesize(MAX_WBITS,
-							   MAX_MEM_LEVEL));
+	ctx->workspace = kvzalloc(zlib_deflate_workspacesize(MAX_WBITS,
+							    MAX_MEM_LEVEL),
+				  GFP_KERNEL);
 	if (!ctx->workspace)
 		goto error;
 
@@ -390,7 +392,7 @@ static void *deflate_create_cctx(const char *name)
 	return ctx;
 
 error:
-	vfree(ctx->workspace);
+	kvfree(ctx->workspace);
 	kfree(ctx);
 	return NULL;
 }
@@ -403,7 +405,7 @@ static void *deflate_create_dctx(const char *name)
 	if (!ctx)
 		return NULL;
 
-	ctx->workspace = vzalloc(zlib_inflate_workspacesize());
+	ctx->workspace = kvzalloc(zlib_inflate_workspacesize(), GFP_KERNEL);
 	if (!ctx->workspace)
 		goto error;
 
@@ -414,7 +416,7 @@ static void *deflate_create_dctx(const char *name)
 	return ctx;
 
 error:
-	vfree(ctx->workspace);
+	kvfree(ctx->workspace);
 	kfree(ctx);
 	return NULL;
 }
@@ -427,7 +429,7 @@ static void deflate_destroy_ctx(void *data)
 		zlib_inflateEnd(&ctx->stream);
 	else
 		zlib_deflateEnd(&ctx->stream);
-	vfree(ctx->workspace);
+	kvfree(ctx->workspace);
 	kfree(ctx);
 }
 

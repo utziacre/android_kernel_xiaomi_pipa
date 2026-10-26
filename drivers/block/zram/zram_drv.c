@@ -1474,7 +1474,7 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	void *src, *dst, *mem;
 	struct zcomp_strm *zstrm;
 	struct page *page = bvec->bv_page;
-	u32 checksum;
+	u32 checksum = 0;
 	unsigned long element = 0;
 	enum zram_pageflags flags = 0;
 
@@ -1485,6 +1485,18 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 		flags = ZRAM_SAME;
 		atomic64_inc(&zram->stats.same_pages);
 		goto out;
+	}
+
+	if (!zram_dedup_enabled(zram)) {
+		zstrm = zcomp_stream_get(zram->comp);
+		ret = zcomp_compress(zstrm, mem, &comp_len);
+		kunmap_atomic(mem);
+		if (unlikely(ret)) {
+			zcomp_stream_put(zram->comp);
+			pr_err("Compression failed! err=%d\n", ret);
+			return ret;
+		}
+		goto compressed;
 	}
 	kunmap_atomic(mem);
 
@@ -1508,6 +1520,7 @@ compress_again:
 		return ret;
 	}
 
+compressed:
 	if (comp_len >= huge_class_size)
 		comp_len = PAGE_SIZE;
 	/*

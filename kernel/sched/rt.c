@@ -2054,6 +2054,7 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 				     !cpumask_test_cpu(lowest_rq->cpu, task->cpus_ptr) ||
 				     task_running(rq, task) ||
 				     !rt_task(task) ||
+				     __migrate_disabled(task) ||
 				     !task_on_rq_queued(task))) {
 
 				double_unlock_balance(rq, lowest_rq);
@@ -2593,6 +2594,16 @@ prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio)
 			resched_curr(rq);
 #endif /* CONFIG_SMP */
 	} else {
+		/*
+		 * The task is queued but not running, so it is sorted into
+		 * rq->rt.pushable_tasks by its old priority. A priority change
+		 * (PI boost) has to be reflected there as well, otherwise the
+		 * push logic keeps treating it as a low priority task and it can
+		 * be starved behind other pushable tasks.
+		 */
+		if (p->nr_cpus_allowed > 1)
+			enqueue_pushable_task(rq, p);
+
 		/*
 		 * This task is not running, but if it is
 		 * greater than the current running task

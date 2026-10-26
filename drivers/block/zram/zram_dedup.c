@@ -78,8 +78,10 @@ static bool zram_dedup_match(struct zram *zram, struct zram_entry *entry,
 		match = !memcmp(mem, cmem, PAGE_SIZE);
 	} else {
 		zstrm = zcomp_dstream_get(zram->comp);
-		if (!zcomp_decompress(zstrm, cmem, entry->len, zstrm->buffer))
-			match = !memcmp(mem, zstrm->buffer, PAGE_SIZE);
+		spin_lock(&zram->dedup_buf_lock);
+		if (!zcomp_decompress(zstrm, cmem, entry->len, zram->dedup_buf))
+			match = !memcmp(mem, zram->dedup_buf, PAGE_SIZE);
+		spin_unlock(&zram->dedup_buf_lock);
 		zcomp_dstream_put(zram->comp);
 	}
 	zs_unmap_object(zram->mem_pool, entry->handle);
@@ -238,6 +240,15 @@ int zram_dedup_init(struct zram *zram, size_t num_pages)
 		return -ENOMEM;
 	}
 
+	zram->dedup_buf = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+	if (!zram->dedup_buf) {
+		vfree(zram->hash);
+		zram->hash = NULL;
+		zram->hash_size = 0;
+		return -ENOMEM;
+	}
+	spin_lock_init(&zram->dedup_buf_lock);
+
 	for (i = 0; i < zram->hash_size; i++) {
 		hash = &zram->hash[i];
 		spin_lock_init(&hash->lock);
@@ -252,4 +263,8 @@ void zram_dedup_fini(struct zram *zram)
 	vfree(zram->hash);
 	zram->hash = NULL;
 	zram->hash_size = 0;
+	if (zram->dedup_buf) {
+		free_page((unsigned long)zram->dedup_buf);
+		zram->dedup_buf = NULL;
+	}
 }

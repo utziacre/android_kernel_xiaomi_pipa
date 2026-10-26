@@ -159,6 +159,37 @@ static inline bool conservative_pl(void)
 #endif
 }
 
+/*
+ * A large jump in the requested frequency skips the up rate limit.
+ *
+ * The limit exists so that a gradually changing load does not turn into a
+ * stream of OPP transitions, each of which costs time and energy for very
+ * little. A jump is the opposite case: the work that needs the higher
+ * frequency is already there, so holding the request back for another
+ * up_rate_limit only means running the first part of it at the old
+ * frequency, which is exactly the latency the ramp was meant to hide.
+ *
+ * sched_freq_ramp_jump is how big the jump has to be, in Q10 of the policy's
+ * maximum frequency, before the limit is skipped. 0 disables the bypass,
+ * 1024 makes every increase bypass the limit.
+ */
+__read_mostly unsigned int sysctl_sched_freq_ramp_jump = 256;
+
+static bool sugov_ramp_jump(struct sugov_policy *sg_policy,
+			    unsigned int next_freq)
+{
+	unsigned int max_freq = sg_policy->policy->cpuinfo.max_freq;
+
+	if (!sysctl_sched_freq_ramp_jump || !max_freq)
+		return false;
+
+	if (next_freq <= sg_policy->next_freq)
+		return false;
+
+	return (u64)(next_freq - sg_policy->next_freq) * 1024 >=
+		(u64)sysctl_sched_freq_ramp_jump * max_freq;
+}
+
 static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 				     unsigned int next_freq)
 {
@@ -167,7 +198,8 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 	delta_ns = time - sg_policy->last_freq_update_time;
 
 	if (next_freq > sg_policy->next_freq &&
-	    delta_ns < sg_policy->up_rate_delay_ns)
+	    delta_ns < sg_policy->up_rate_delay_ns &&
+	    !sugov_ramp_jump(sg_policy, next_freq))
 			return true;
 
 	if (next_freq < sg_policy->next_freq &&

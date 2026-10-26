@@ -77,10 +77,10 @@ static bool zram_dedup_match(struct zram *zram, struct zram_entry *entry,
 	if (entry->len == PAGE_SIZE) {
 		match = !memcmp(mem, cmem, PAGE_SIZE);
 	} else {
-		zstrm = zcomp_stream_get(zram->comp);
+		zstrm = zcomp_dstream_get(zram->comp);
 		if (!zcomp_decompress(zstrm, cmem, entry->len, zstrm->buffer))
 			match = !memcmp(mem, zstrm->buffer, PAGE_SIZE);
-		zcomp_stream_put(zram->comp);
+		zcomp_dstream_put(zram->comp);
 	}
 	zs_unmap_object(zram->mem_pool, entry->handle);
 

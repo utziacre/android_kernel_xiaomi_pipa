@@ -19,7 +19,10 @@ struct zcomp_strm {
 
 /* dynamic per-device compression frontend */
 struct zcomp {
+	/* per-CPU compression (write) stream */
 	struct zcomp_strm * __percpu *stream;
+	/* per-CPU decompression (read) stream */
+	struct zcomp_strm * __percpu *dstream;
 	const char *name;
 	struct hlist_node node;
 };
@@ -34,6 +37,9 @@ void zcomp_destroy(struct zcomp *comp);
 
 struct zcomp_strm *zcomp_stream_get(struct zcomp *comp);
 void zcomp_stream_put(struct zcomp *comp);
+
+struct zcomp_strm *zcomp_dstream_get(struct zcomp *comp);
+void zcomp_dstream_put(struct zcomp *comp);
 
 int zcomp_compress(struct zcomp_strm *zstrm,
 		const void *src, unsigned int *dst_len);

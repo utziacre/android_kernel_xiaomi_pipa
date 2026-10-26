@@ -69,6 +69,12 @@ struct sched_domain_shared {
 	atomic_t	nr_busy_cpus;
 	int		has_idle_cores;
 
+	/*
+	 * SIS_UTIL: how many CPUs select_idle_cpu() may scan in this domain,
+	 * derived from the domain's total utilization by the load balancer.
+	 */
+	int		nr_idle_scan;
+
 	bool            overutilized;
 };
 

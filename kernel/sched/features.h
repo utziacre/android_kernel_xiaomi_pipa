@@ -69,6 +69,20 @@
 #define SCHED_FEAT_SIS_PROP 1
 
 /*
+ * SIS_UTIL: bound the idle CPU scan of select_idle_cpu() by the utilization
+ * of the LLC domain instead of a fixed cost estimate. A saturated domain is
+ * not scanned at all.
+ *
+ * Disabled on purpose: the heuristic was introduced for very large LLCs
+ * where a full scan is expensive. On an 8 CPU phone the scan costs a few
+ * microseconds, while skipping it can cost a whole scheduling slice of
+ * runnable wait, so the trade is the wrong way round for latency. It also
+ * feeds on sds->total_util, which is PELT based, while everything else in
+ * this kernel (task placement, schedutil, idle prediction) uses WALT.
+ */
+#define SCHED_FEAT_SIS_UTIL 0
+
+/*
  * Issue a WARN when we do multiple update_rq_clock() calls
  * in a single rq->lock section. Default disabled because the
  * annotations are not complete.
@@ -149,7 +163,7 @@
  * preserved negative lag makes a freshly woken task ineligible and it loses
  * wakeup preemption entirely.
  */
-#define SCHED_FEAT_PLACE_LAG 0
+#define SCHED_FEAT_PLACE_LAG sysctl_sched_place_lag
 
 /*
  * EEVDF: start new tasks with half a slice.

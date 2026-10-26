@@ -214,7 +214,21 @@ __read_mostly unsigned int sysctl_sched_prefer_spread;
 unsigned int sysctl_walt_rtg_cfs_boost_prio = 99; /* disabled by default */
 unsigned int sysctl_walt_low_latency_task_threshold; /* disabled by default */
 #endif
-__read_mostly unsigned int sysctl_sched_force_lb_enable = 1;
+
+/*
+ * Pull tasks onto a big CPU that is about to go idle even when its average
+ * idle time says it will be woken again soon, as long as the silver cluster
+ * still holds big tasks. The intent is to rescue a big task stuck on a
+ * little CPU, but it overrides both avg_idle guards in idle_balance(): the
+ * early "this CPU will be busy again shortly, do not bother" exit and the
+ * per domain "this domain costs more than the idle time we expect" limit.
+ *
+ * What gets migrated that way is mostly a task that was about to be woken in
+ * place, so the price is a cold cache for no gain. Wakeup placement still
+ * moves big tasks to big CPUs by itself, this only affects the newidle
+ * fallback path, so keeping it off does not strand big tasks on silver.
+ */
+__read_mostly unsigned int sysctl_sched_force_lb_enable;
 
 static inline void update_load_add(struct load_weight *lw, unsigned long inc)
 {

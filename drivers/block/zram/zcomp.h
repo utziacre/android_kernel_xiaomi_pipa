@@ -10,10 +10,14 @@
 #ifndef _ZCOMP_H_
 #define _ZCOMP_H_
 
+struct zcomp_ops;
+
 struct zcomp_strm {
 	/* compression/decompression buffer */
 	void *buffer;
-	struct crypto_comp *tfm;
+	/* backend context (compression state, crypto tfm, or NULL) */
+	void *ctx;
+	const struct zcomp_ops *ops;
 	spinlock_t zcomp_lock;
 };
 
@@ -21,8 +25,12 @@ struct zcomp_strm {
 struct zcomp {
 	/* per-CPU compression (write) stream */
 	struct zcomp_strm * __percpu *stream;
-	/* per-CPU decompression (read) stream */
+	/* per-CPU decompression (read) stream for stateful backends */
 	struct zcomp_strm * __percpu *dstream;
+	/* shared decompression stream for stateless backends */
+	struct zcomp_strm *dstrm;
+	spinlock_t dstrm_lock;
+	const struct zcomp_ops *ops;
 	const char *name;
 	struct hlist_node node;
 };

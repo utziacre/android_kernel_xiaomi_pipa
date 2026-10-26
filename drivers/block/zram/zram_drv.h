@@ -119,6 +119,9 @@ struct zram {
 	struct gendisk *disk;
 	struct zram_hash *hash;
 	size_t hash_size;
+	/* Scratch page for dedup comparisons */
+	void *dedup_buf;
+	spinlock_t dedup_buf_lock;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
 	/*

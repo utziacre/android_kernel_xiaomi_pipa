@@ -133,6 +133,24 @@ void zcomp_stream_put(struct zcomp *comp)
 	put_local_ptr(zstrm);
 }
 
+struct zcomp_strm *zcomp_dstream_get(struct zcomp *comp)
+{
+	struct zcomp_strm *zstrm;
+
+	zstrm = *get_local_ptr(comp->dstream);
+	spin_lock(&zstrm->zcomp_lock);
+	return zstrm;
+}
+
+void zcomp_dstream_put(struct zcomp *comp)
+{
+	struct zcomp_strm *zstrm;
+
+	zstrm = *this_cpu_ptr(comp->dstream);
+	spin_unlock(&zstrm->zcomp_lock);
+	put_local_ptr(zstrm);
+}
+
 int zcomp_compress(struct zcomp_strm *zstrm,
 		const void *src, unsigned int *dst_len)
 {
@@ -170,9 +188,10 @@ int zcomp_decompress(struct zcomp_strm *zstrm,
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 {
 	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
-	struct zcomp_strm *zstrm;
+	struct zcomp_strm *zstrm, *dstrm;
 
-	if (WARN_ON(*per_cpu_ptr(comp->stream, cpu)))
+	if (WARN_ON(*per_cpu_ptr(comp->stream, cpu) ||
+		    *per_cpu_ptr(comp->dstream, cpu)))
 		return 0;
 
 	zstrm = zcomp_strm_alloc(comp);
@@ -180,20 +199,35 @@ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 		pr_err("Can't allocate a compression stream\n");
 		return -ENOMEM;
 	}
+
+	dstrm = zcomp_strm_alloc(comp);
+	if (IS_ERR_OR_NULL(dstrm)) {
+		pr_err("Can't allocate a decompression stream\n");
+		zcomp_strm_free(zstrm);
+		return -ENOMEM;
+	}
+
 	spin_lock_init(&zstrm->zcomp_lock);
+	spin_lock_init(&dstrm->zcomp_lock);
 	*per_cpu_ptr(comp->stream, cpu) = zstrm;
+	*per_cpu_ptr(comp->dstream, cpu) = dstrm;
 	return 0;
 }
 
 int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node)
 {
 	struct zcomp *comp = hlist_entry(node, struct zcomp, node);
-	struct zcomp_strm *zstrm;
+	struct zcomp_strm *zstrm, *dstrm;
 
 	zstrm = *per_cpu_ptr(comp->stream, cpu);
 	if (!IS_ERR_OR_NULL(zstrm))
 		zcomp_strm_free(zstrm);
 	*per_cpu_ptr(comp->stream, cpu) = NULL;
+
+	dstrm = *per_cpu_ptr(comp->dstream, cpu);
+	if (!IS_ERR_OR_NULL(dstrm))
+		zcomp_strm_free(dstrm);
+	*per_cpu_ptr(comp->dstream, cpu) = NULL;
 	return 0;
 }
 
@@ -205,19 +239,30 @@ static int zcomp_init(struct zcomp *comp)
 	if (!comp->stream)
 		return -ENOMEM;
 
+	comp->dstream = alloc_percpu(struct zcomp_strm *);
+	if (!comp->dstream) {
+		free_percpu(comp->stream);
+		comp->stream = NULL;
+		return -ENOMEM;
+	}
+
 	ret = cpuhp_state_add_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
 	if (ret < 0)
 		goto cleanup;
 	return 0;
 
 cleanup:
+	free_percpu(comp->dstream);
+	comp->dstream = NULL;
 	free_percpu(comp->stream);
+	comp->stream = NULL;
 	return ret;
 }
 
 void zcomp_destroy(struct zcomp *comp)
 {
 	cpuhp_state_remove_instance(CPUHP_ZCOMP_PREPARE, &comp->node);
+	free_percpu(comp->dstream);
 	free_percpu(comp->stream);
 	kfree(comp);
 }

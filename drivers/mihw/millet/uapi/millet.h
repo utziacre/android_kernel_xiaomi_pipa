@@ -55,16 +55,6 @@ enum MILLET_TYPE {
 };
 
 #define TYPE_VALID(x) ((x > O_TYPE) && (x < MILLET_TYPES_NUM))
-static const char *NAME_ARRAY[NAME_MAXLEN] = {
-	"NULL",
-	"SIG",
-	"BINDER",
-	"BINDER_STAT",
-	"MEM",
-	"PKG",
-	"HANDSHK",
-	"invalid",
-};
 
 enum BINDER_EXTRA_MSG {
 	BINDER_BUFF_WARN,

@@ -217,96 +217,143 @@ static void binder_lru_freelist_add(struct binder_alloc *alloc,
 	}
 }
 
-static int binder_install_single_page(struct binder_alloc *alloc,
-				      struct binder_lru_page *lru_page,
-				      unsigned long addr)
+/* Number of page pointers kept on the stack for page installation */
+#define BINDER_INSTALL_STACK_PAGES	8
+
+static int binder_install_pages(struct binder_alloc *alloc,
+				unsigned long start, unsigned long final)
 {
-	struct page *page;
+	struct page *page_onstack[BINDER_INSTALL_STACK_PAGES];
+	struct page **pages = page_onstack;
+	size_t num_pages = (final - start) / PAGE_SIZE;
+	unsigned long page_addr;
+	size_t i;
+	bool mm_locked = false;
+	bool mm_held = false;
 	int ret = 0;
 
-	if (!mmget_not_zero(alloc->vma_vm_mm))
-		return -ESRCH;
+	/* Fast path: all pages are already installed */
+	for (page_addr = start; page_addr < final; page_addr += PAGE_SIZE) {
+		size_t index = (page_addr - (uintptr_t)alloc->buffer) / PAGE_SIZE;
 
-	/*
-	 * Don't allocate page in mmap_write_lock, this can block
-	 * mmap_rwsem for a long time; Meanwhile, allocation failure
-	 * doesn't necessarily need to return -ENOMEM, if lru_page
-	 * has been installed, we can still return 0(success).
-	 */
-	page = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+		if (!binder_get_installed_page(&alloc->pages[index]))
+			break;
+	}
+	if (page_addr >= final)
+		return 0;
 
-	/*
-	 * Protected with mmap_sem in write mode as multiple tasks
-	 * might race to install the same page.
-	 */
-	mmap_write_lock(alloc->vma_vm_mm);
-	if (binder_get_installed_page(lru_page)) {
-		ret = 1;
-		goto out;
+	if (num_pages > BINDER_INSTALL_STACK_PAGES) {
+		pages = kcalloc(num_pages, sizeof(*pages), GFP_KERNEL);
+		if (!pages)
+			return -ENOMEM;
+	} else {
+		memset(page_onstack, 0, sizeof(page_onstack));
 	}
 
-	if (!alloc->vma) {
-		pr_err("%d: %s failed, no vma\n", alloc->pid, __func__);
+	if (!mmget_not_zero(alloc->vma_vm_mm)) {
 		ret = -ESRCH;
 		goto out;
 	}
+	mm_held = true;
 
-	if (!page) {
-		pr_err("%d: failed to allocate page\n", alloc->pid);
-		ret = -ENOMEM;
-		goto out;
+	/*
+	 * Don't allocate pages in mmap_write_lock, this can block the
+	 * mmap_rwsem for a long time. Pages installed by a concurrent
+	 * transaction are skipped here and re-checked below.
+	 */
+	for (i = 0, page_addr = start; page_addr < final;
+	     page_addr += PAGE_SIZE, i++) {
+		size_t index = (page_addr - (uintptr_t)alloc->buffer) / PAGE_SIZE;
+
+		if (binder_get_installed_page(&alloc->pages[index]))
+			continue;
+
+		pages[i] = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+		if (!pages[i]) {
+			pr_err("%d: failed to allocate page\n", alloc->pid);
+			break;
+		}
 	}
 
-	ret = vm_insert_page(alloc->vma, addr, page);
-	if (ret) {
-		pr_err("%d: %s failed to insert page at offset %lx with %d\n",
-		       alloc->pid, __func__, addr - (uintptr_t)alloc->buffer,
-		       ret);
-		ret = -ENOMEM;
-		goto out;
+	/*
+	 * Protected with mmap_sem in write mode as multiple tasks
+	 * might race to install the same page. Install the whole range
+	 * with a single lock acquisition.
+	 */
+	mmap_write_lock(alloc->vma_vm_mm);
+	mm_locked = true;
+
+	for (i = 0, page_addr = start; page_addr < final;
+	     page_addr += PAGE_SIZE, i++) {
+		size_t index = (page_addr - (uintptr_t)alloc->buffer) / PAGE_SIZE;
+		struct binder_lru_page *lru_page = &alloc->pages[index];
+		struct page *page = pages[i];
+
+		if (!page) {
+			/*
+			 * Either the page was installed by a concurrent
+			 * transaction or alloc_page() failed. Only the
+			 * former is fine.
+			 */
+			if (binder_get_installed_page(lru_page))
+				continue;
+			ret = -ENOMEM;
+			break;
+		}
+
+		if (!alloc->vma) {
+			pr_err("%d: %s failed, no vma\n", alloc->pid, __func__);
+			ret = -ESRCH;
+			break;
+		}
+
+		if (binder_get_installed_page(lru_page)) {
+			__free_page(page);
+			pages[i] = NULL;
+			continue;
+		}
+
+		trace_binder_alloc_page_start(alloc, index);
+		ret = vm_insert_page(alloc->vma, page_addr, page);
+		if (ret) {
+			pr_err("%d: %s failed to insert page at offset %lx with %d\n",
+			       alloc->pid, __func__,
+			       page_addr - (uintptr_t)alloc->buffer, ret);
+			break;
+		}
+
+		/* Mark page installation complete and safe to use */
+		binder_set_installed_page(lru_page, page);
+		pages[i] = NULL;
+		trace_binder_alloc_page_end(alloc, index);
 	}
 
-	/* Mark page installation complete and safe to use */
-	binder_set_installed_page(lru_page, page);
 out:
-	mmap_write_unlock(alloc->vma_vm_mm);
-	mmput_async(alloc->vma_vm_mm);
-	if (ret && page)
-		__free_page(page);
-	return ret < 0 ? ret : 0;
+	if (mm_locked)
+		mmap_write_unlock(alloc->vma_vm_mm);
+	if (mm_held)
+		mmput_async(alloc->vma_vm_mm);
+
+	for (i = 0; i < num_pages; i++) {
+		if (pages[i])
+			__free_page(pages[i]);
+	}
+	if (pages != page_onstack)
+		kfree(pages);
+
+	return ret;
 }
 
 static int binder_install_buffer_pages(struct binder_alloc *alloc,
 				       struct binder_buffer *buffer,
 				       size_t size)
 {
-	struct binder_lru_page *page;
 	unsigned long start, final;
-	unsigned long page_addr;
 
 	start = (uintptr_t)buffer->user_data & PAGE_MASK;
 	final = PAGE_ALIGN((uintptr_t)buffer->user_data + size);
 
-	for (page_addr = start; page_addr < final; page_addr += PAGE_SIZE) {
-		unsigned long index;
-		int ret;
-
-		index = (page_addr - (uintptr_t)alloc->buffer) / PAGE_SIZE;
-		page = &alloc->pages[index];
-
-		if (binder_get_installed_page(page))
-			continue;
-
-		trace_binder_alloc_page_start(alloc, index);
-
-		ret = binder_install_single_page(alloc, page, page_addr);
-		if (ret)
-			return ret;
-
-		trace_binder_alloc_page_end(alloc, index);
-	}
-
-	return 0;
+	return binder_install_pages(alloc, start, final);
 }
 
 /* The range of pages should exclude those shared with other buffers */

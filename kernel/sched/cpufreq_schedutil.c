@@ -285,6 +285,49 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy, u64 time,
 }
 
 #define TARGET_LOAD 80
+
+/*
+ * Utilization to frequency map.
+ *
+ * The upstream map multiplies the utilization by a fixed 1.25 to leave
+ * headroom, which is wrong in both directions. 25% of a low utilization is
+ * usually not even enough to move the request to the next OPP, so a short
+ * burst on an otherwise idle CPU still runs at the bottom of the table, while
+ * at the top the same 25% buys one or two OPPs and a large step in V^2 for no
+ * benefit, because the request is clamped to the maximum frequency anyway.
+ *
+ * Express the headroom as a fraction of the *remaining* capacity instead:
+ *
+ *     demand = util + (cap - util) * margin
+ *
+ * The absolute headroom now shrinks as the CPU fills up, which is how the load
+ * actually behaves: an idle CPU fluctuates by a large fraction of its
+ * utilization and needs a lot of slack, whereas a saturated one is already
+ * stable and does not need the extra percentage. As util goes to zero the
+ * request approaches cap * margin rather than zero, which keeps short tasks
+ * off the slowest OPP, and as util approaches cap the request converges to the
+ * maximum by itself, so no separate taper is needed at the top.
+ *
+ *  sched_freq_util_margin  margin as a fraction of the free capacity,
+ *                          Q10 (256 = 0.25)
+ */
+__read_mostly unsigned int sysctl_sched_freq_util_margin = 256;
+
+static unsigned long sugov_map_util_freq(unsigned long util,
+					 unsigned long freq, unsigned long cap)
+{
+	unsigned long demand;
+
+	if (!util || !cap)
+		return 0;
+
+	if (util >= cap)
+		return freq;
+
+	demand = util + mult_frac(cap - util, sysctl_sched_freq_util_margin, 1024);
+
+	return freq * demand / cap;
+}
 /**
  * get_next_freq - Compute a new frequency for a given cpufreq policy.
  * @sg_policy: schedutil policy object to compute the new frequency for.
@@ -303,6 +346,9 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy, u64 time,
  *
  * Take C = 1.25 for the frequency tipping point at (util / max) = 0.8.
  *
+ * The margin is applied by sugov_map_util_freq(), which tapers it down at the
+ * top of the frequency range, see the comment above it.
+ *
  * The lowest driver-supported frequency which is equal or greater than the raw
  * next_freq (as calculated above) is returned, subject to policy min/max and
  * cpufreq driver limitations.
@@ -315,7 +361,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 				policy->cpuinfo.max_freq : policy->cur;
 	unsigned int idx, l_freq, h_freq;
 
-	freq = map_util_freq(util, freq, max);
+	freq = sugov_map_util_freq(util, freq, max);
 	trace_sugov_next_freq(policy->cpu, util, max, freq);
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)

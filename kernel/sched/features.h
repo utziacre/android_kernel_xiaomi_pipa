@@ -142,8 +142,14 @@
 
 /*
  * EEVDF: preserve lag when placing entities.
+ *
+ * Runtime switchable through /proc/sys/kernel/sched_place_lag, default on.
+ * It is only useful together with the classic wakeup preemption rule
+ * (sched_wakeup_preempt_gran != 0): with the EEVDF pick based rule a
+ * preserved negative lag makes a freshly woken task ineligible and it loses
+ * wakeup preemption entirely.
  */
-#define SCHED_FEAT_PLACE_LAG 1
+#define SCHED_FEAT_PLACE_LAG 0
 
 /*
  * EEVDF: start new tasks with half a slice.

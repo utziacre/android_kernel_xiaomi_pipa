@@ -140,6 +140,23 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
  */
 unsigned int sysctl_sched_wakeup_granularity		= 1000000UL;
 unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+/*
+ * Classic (pre-EEVDF) wakeup preemption tuning.
+ *
+ * A zero sysctl_sched_wakeup_preempt_gran disables the classic rule and keeps
+ * the EEVDF wakeup preemption path in charge. A non zero value preempts the
+ * current task as soon as the wakee is ahead by more than
+ * 'slice * gran / 1024' of virtual time, without requiring the wakee to be
+ * eligible first.
+ *
+ * PLACE_LAG keeps the virtual lag of a task across sleeps. That only pays off
+ * together with the classic rule: with the EEVDF pick based rule a preserved
+ * negative lag makes a freshly woken task ineligible and it then loses wakeup
+ * preemption entirely, which more than doubles hackbench. Defaults: lag
+ * preserved, one slice of preemption granularity.
+ */
+unsigned int sysctl_sched_place_lag = 1;
+unsigned int sysctl_sched_wakeup_preempt_gran = 1024;
 
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);

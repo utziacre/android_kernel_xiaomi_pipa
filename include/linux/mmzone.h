@@ -29,6 +29,8 @@
 #endif
 #define MAX_ORDER_NR_PAGES (1 << (MAX_ORDER - 1))
 
+#define KCOMPRESS_QUEUE_SIZE 128
+
 /*
  * PAGE_ALLOC_COSTLY_ORDER is the order at which allocations are deemed
  * costly to service.  That is between allocation orders which should
@@ -912,6 +914,13 @@ typedef struct pglist_data {
 
 	wait_queue_head_t kshrinkd_wait;
 	struct task_struct *kshrinkd;
+
+	wait_queue_head_t kcompress_wait;
+	struct task_struct *kcompressd;
+	spinlock_t kcompress_lock;
+	struct page *kcompress_queue[KCOMPRESS_QUEUE_SIZE];
+	unsigned int kcompress_head;
+	unsigned int kcompress_tail;
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;

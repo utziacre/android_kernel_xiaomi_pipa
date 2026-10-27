@@ -22,6 +22,8 @@
 #include <linux/writeback.h>
 #include <linux/frontswap.h>
 #include <linux/blkdev.h>
+#include <linux/freezer.h>
+#include <linux/kthread.h>
 #include <linux/psi.h>
 #include <linux/uio.h>
 #include <linux/sched/task.h>
@@ -194,6 +196,121 @@ bad_bmap:
 }
 
 /*
+ * Write a swapcache page out after it has been handed to kcompressd.  The
+ * page is still locked here; either frontswap or __swap_writepage() finishes
+ * the writeback and unlocks it.
+ */
+static void kcompressd_swapout(struct page *page)
+{
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
+
+	if (frontswap_store(page) == 0) {
+		set_page_writeback(page);
+		unlock_page(page);
+		end_page_writeback(page);
+	} else {
+		__swap_writepage(page, &wbc, end_swap_bio_write);
+	}
+
+	put_page(page);
+}
+
+static bool kcompressd_queue_empty(pg_data_t *pgdat)
+{
+	return READ_ONCE(pgdat->kcompress_head) ==
+	       READ_ONCE(pgdat->kcompress_tail);
+}
+
+static bool kcompressd_dequeue(pg_data_t *pgdat, struct page **page)
+{
+	unsigned long flags;
+	bool ret = false;
+
+	spin_lock_irqsave(&pgdat->kcompress_lock, flags);
+	if (pgdat->kcompress_tail != pgdat->kcompress_head) {
+		*page = pgdat->kcompress_queue[pgdat->kcompress_tail];
+		pgdat->kcompress_tail = (pgdat->kcompress_tail + 1) %
+					KCOMPRESS_QUEUE_SIZE;
+		ret = true;
+	}
+	spin_unlock_irqrestore(&pgdat->kcompress_lock, flags);
+
+	return ret;
+}
+
+/*
+ * Hand an anonymous page selected by kswapd to kcompressd.  Returning true
+ * means the caller must leave the page locked; kcompressd will unlock it
+ * after the compression/writeback completes.
+ */
+static bool kcompressd_store(struct page *page)
+{
+	struct swap_info_struct *sis = page_swap_info(page);
+	pg_data_t *pgdat;
+	unsigned long flags;
+	unsigned int next;
+
+	if (!current_is_kswapd() || PageTransHuge(page) || !PageAnon(page))
+		return false;
+
+	if (!(sis->flags & SWP_SYNCHRONOUS_IO))
+		return false;
+
+	pgdat = NODE_DATA(page_to_nid(page));
+	if (unlikely(!pgdat->kcompressd))
+		return false;
+
+	spin_lock_irqsave(&pgdat->kcompress_lock, flags);
+	next = (pgdat->kcompress_head + 1) % KCOMPRESS_QUEUE_SIZE;
+	if (next == pgdat->kcompress_tail) {
+		spin_unlock_irqrestore(&pgdat->kcompress_lock, flags);
+		return false;
+	}
+
+	get_page(page);
+	pgdat->kcompress_queue[pgdat->kcompress_head] = page;
+	smp_wmb();
+	pgdat->kcompress_head = next;
+	spin_unlock_irqrestore(&pgdat->kcompress_lock, flags);
+
+	wake_up_interruptible(&pgdat->kcompress_wait);
+	return true;
+}
+
+int kcompressd(void *p)
+{
+	pg_data_t *pgdat = p;
+	struct page *page;
+
+	current->flags |= PF_MEMALLOC | PF_KSWAPD;
+	set_freezable();
+
+	while (!kthread_should_stop()) {
+		wait_event_freezable(pgdat->kcompress_wait,
+			!kcompressd_queue_empty(pgdat) ||
+			kthread_should_stop());
+
+		if (kthread_should_stop())
+			break;
+
+		while (kcompressd_dequeue(pgdat, &page))
+			kcompressd_swapout(page);
+	}
+
+	/* Drain anything queued while the thread was being stopped. */
+	while (kcompressd_dequeue(pgdat, &page))
+		kcompressd_swapout(page);
+
+	return 0;
+}
+
+/*
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
  */
@@ -205,6 +322,8 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		unlock_page(page);
 		goto out;
 	}
+	if (kcompressd_store(page))
+		return 0;
 	if (frontswap_store(page) == 0) {
 		set_page_writeback(page);
 		unlock_page(page);

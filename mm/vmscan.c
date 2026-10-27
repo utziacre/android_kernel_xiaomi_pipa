@@ -6994,6 +6994,21 @@ int kswapd_run(int nid)
 	if (pgdat->kswapd)
 		return 0;
 
+	spin_lock_init(&pgdat->kcompress_lock);
+	init_waitqueue_head(&pgdat->kcompress_wait);
+	pgdat->kcompress_head = 0;
+	pgdat->kcompress_tail = 0;
+
+	pgdat->kcompressd = kthread_run(kcompressd, pgdat, "kcompressd%d", nid);
+	if (IS_ERR(pgdat->kcompressd)) {
+		/* failure at boot is fatal */
+		BUG_ON(system_state < SYSTEM_RUNNING);
+		pr_err("Failed to start kcompressd on node %d\n", nid);
+		ret = PTR_ERR(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
+		return ret;
+	}
+
 	pgdat->kshrinkd = kthread_run(kshrinkd, pgdat, "kshrinkd%d", nid);
 	if (IS_ERR(pgdat->kshrinkd)) {
 		/* failure at boot is fatal */
@@ -7001,6 +7016,8 @@ int kswapd_run(int nid)
 		pr_err("Failed to start kshrinkd on node %d\n", nid);
 		ret = PTR_ERR(pgdat->kshrinkd);
 		pgdat->kshrinkd = NULL;
+		kthread_stop(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
 		return ret;
 	}
 
@@ -7013,6 +7030,8 @@ int kswapd_run(int nid)
 		pgdat->kswapd = NULL;
 		kthread_stop(pgdat->kshrinkd);
 		pgdat->kshrinkd = NULL;
+		kthread_stop(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
 	}
 	return ret;
 }
@@ -7025,6 +7044,7 @@ void kswapd_stop(int nid)
 {
 	struct task_struct *kswapd = NODE_DATA(nid)->kswapd;
 	struct task_struct *kshrinkd = NODE_DATA(nid)->kshrinkd;
+	struct task_struct *kcompressd = NODE_DATA(nid)->kcompressd;
 
 	if (kswapd) {
 		kthread_stop(kswapd);
@@ -7033,6 +7053,10 @@ void kswapd_stop(int nid)
 	if (kshrinkd) {
 		kthread_stop(kshrinkd);
 		NODE_DATA(nid)->kshrinkd = NULL;
+	}
+	if (kcompressd) {
+		kthread_stop(kcompressd);
+		NODE_DATA(nid)->kcompressd = NULL;
 	}
 }
 

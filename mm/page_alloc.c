@@ -3110,6 +3110,22 @@ static bool free_unref_page_prepare(struct page *page, unsigned long pfn)
 	return true;
 }
 
+#ifdef CONFIG_PREEMPT_RT_BASE
+/*
+ * Migratetype for pages that bypass the per-CPU lists and are handed to the
+ * buddy allocator directly.  Mirror free_unref_page_commit(): keep
+ * MIGRATE_ISOLATE (free_one_page() refreshes it from the pageblock) and fold
+ * HIGHATOMIC and the other pcp-less types back to MIGRATE_MOVABLE.
+ */
+static int buddy_migratetype(int migratetype)
+{
+	if (migratetype < MIGRATE_PCPTYPES || is_migrate_isolate(migratetype))
+		return migratetype;
+
+	return MIGRATE_MOVABLE;
+}
+#endif
+
 static void free_unref_page_commit(struct page *page, unsigned long pfn,
 				   struct list_head *dst)
 {
@@ -3150,7 +3166,9 @@ static void free_unref_page_commit(struct page *page, unsigned long pfn,
  */
 void free_unref_page(struct page *page)
 {
+#ifndef CONFIG_PREEMPT_RT_BASE
 	unsigned long flags;
+#endif
 	unsigned long pfn = page_to_pfn(page);
 	struct zone *zone = page_zone(page);
 	LIST_HEAD(dst);
@@ -3158,9 +3176,29 @@ void free_unref_page(struct page *page)
 	if (!free_unref_page_prepare(page, pfn))
 		return;
 
+#ifdef CONFIG_PREEMPT_RT_BASE
+	/*
+	 * pa_lock is a per-CPU sleeping lock and its owner may block inside
+	 * free_unref_page_commit() -> free_one_page() -> zone->lock.  A
+	 * waiter would then sleep while holding rcu_read_lock(), which every
+	 * rt_spin_lock() takes, so the owner being off-CPU would keep an RCU
+	 * grace period from completing.  Never queue behind it: hand the
+	 * page straight to the buddy allocator instead.
+	 */
+	if (!local_trylock(pa_lock)) {
+		int mt = buddy_migratetype(get_pcppage_migratetype(page));
+
+		__count_vm_event(PGFREE);
+		free_one_page(zone, page, pfn, 0, mt);
+		return;
+	}
+	free_unref_page_commit(page, pfn, &dst);
+	local_unlock(pa_lock);
+#else
 	local_lock_irqsave(pa_lock, flags);
 	free_unref_page_commit(page, pfn, &dst);
 	local_unlock_irqrestore(pa_lock, flags);
+#endif
 	if (!list_empty(&dst))
 		free_pcppages_bulk(zone, &dst, false);
 }
@@ -3171,8 +3209,11 @@ void free_unref_page(struct page *page)
 void free_unref_page_list(struct list_head *list)
 {
 	struct page *page, *next;
-	unsigned long flags, pfn;
+	unsigned long pfn;
+#ifndef CONFIG_PREEMPT_RT_BASE
+	unsigned long flags;
 	int batch_count = 0;
+#endif
 	struct list_head dsts[__MAX_NR_ZONES];
 	int i;
 
@@ -3187,13 +3228,45 @@ void free_unref_page_list(struct list_head *list)
 		set_page_private(page, pfn);
 	}
 
-	local_lock_irqsave(pa_lock, flags);
+#ifdef CONFIG_PREEMPT_RT_BASE
+	/*
+	 * pa_lock is a per-CPU sleeping lock and its owner may block inside
+	 * free_unref_page_commit() -> free_one_page() -> zone->lock.  A
+	 * waiter would then sleep while holding rcu_read_lock(), which every
+	 * rt_spin_lock() takes, on top of whatever lock the caller already
+	 * holds - e.g. swapvec_lock from lru_add_drain(), which is exactly
+	 * how a page free ends up stalling an RCU grace period.  Use the
+	 * per-CPU list only when it is free and send the page to the buddy
+	 * allocator otherwise.
+	 */
 	list_for_each_entry_safe(page, next, list, lru) {
-		unsigned long pfn = page_private(page);
 		enum zone_type type;
 
+		pfn = page_private(page);
 		set_page_private(page, 0);
 		trace_mm_page_free_batched(page);
+		list_del(&page->lru);
+		type = page_zonenum(page);
+
+		if (local_trylock(pa_lock)) {
+			free_unref_page_commit(page, pfn, &dsts[type]);
+			local_unlock(pa_lock);
+			continue;
+		}
+
+		__count_vm_event(PGFREE);
+		free_one_page(page_zone(page), page, pfn, 0,
+			      buddy_migratetype(get_pcppage_migratetype(page)));
+	}
+#else
+	local_lock_irqsave(pa_lock, flags);
+	list_for_each_entry_safe(page, next, list, lru) {
+		enum zone_type type;
+
+		pfn = page_private(page);
+		set_page_private(page, 0);
+		trace_mm_page_free_batched(page);
+		list_del(&page->lru);
 		type = page_zonenum(page);
 		free_unref_page_commit(page, pfn, &dsts[type]);
 
@@ -3208,6 +3281,7 @@ void free_unref_page_list(struct list_head *list)
 		}
 	}
 	local_unlock_irqrestore(pa_lock, flags);
+#endif
 
 	for (i = 0; i < __MAX_NR_ZONES; ) {
 		struct page *page;

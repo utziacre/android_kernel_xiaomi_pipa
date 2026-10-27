@@ -82,7 +82,7 @@ static struct ion_buffer *ion_buffer_create(struct ion_heap *heap, size_t len,
 		if (ret == -EINTR || !(heap->flags & ION_HEAP_FLAG_DEFER_FREE))
 			goto free_buffer;
 
-		drain_workqueue(heap->wq);
+		flush_workqueue(heap->wq);
 		if (heap->ops->allocate(heap, buffer, len, flags))
 			goto free_buffer;
 	}

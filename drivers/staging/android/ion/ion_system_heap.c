@@ -457,12 +457,14 @@ void ion_system_heap_free(struct ion_buffer *buffer)
 			ion_heap_buffer_zero(buffer);
 	} else if (vmid > 0) {
 		if (ion_hyp_unassign_sg(table, &vmid, 1, true, false))
-			return;
+			goto out_table;
 	}
 
 	for_each_sg(table->sgl, sg, table->nents, i)
 		free_buffer_page(sys_heap, buffer, sg_page(sg),
 				 get_order(sg->length));
+
+out_table:
 	sg_free_table(table);
 	kfree(table);
 }

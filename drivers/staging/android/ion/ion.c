@@ -6,6 +6,7 @@
  *
  */
 
+#include <linux/cpumask.h>
 #include <linux/miscdevice.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -514,10 +515,19 @@ void ion_add_heap(struct ion_device *idev, struct ion_heap *heap)
 	struct ion_heap_data *hdata = &idev->heap_data[idev->heap_count];
 
 	if (heap->flags & ION_HEAP_FLAG_DEFER_FREE) {
-		heap->wq = alloc_workqueue("%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 0,
-					   heap->name);
+		/*
+		 * max_active is a global limit for an unbound workqueue, so the
+		 * limit of 1 that keeps the frees from occupying every CPU also
+		 * serialises them for the whole system: everything queues behind
+		 * a single worker and the pages only come back to the allocator
+		 * much later than they could.  A CPU runs one thread at a time,
+		 * so allowing max_active frees at once still means at most one
+		 * free per CPU, but a burst of releases can drain in parallel
+		 * instead of one by one.
+		 */
+		heap->wq = alloc_workqueue("%s", WQ_UNBOUND | WQ_MEM_RECLAIM,
+					   num_possible_cpus(), heap->name);
 		BUG_ON(!heap->wq);
-		workqueue_set_max_active(heap->wq, 1);
 	}
 
 	if (heap->ops->shrink)

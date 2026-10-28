@@ -135,7 +135,12 @@ static int sdio_irq_thread(void *_host)
 	int ret;
 	bool ws;
 
-	sched_setscheduler(current, SCHED_FIFO, &param);
+	/*
+	 * The handler runs for as long as the card keeps asserting its
+	 * interrupt, which for a busy SDIO function can be a long time.
+	 * Round-robin bounds it to a timeslice.
+	 */
+	sched_setscheduler(current, SCHED_RR, &param);
 
 	/*
 	 * We want to allow for SDIO cards to work even on non SDIO

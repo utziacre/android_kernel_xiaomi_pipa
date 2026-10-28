@@ -554,6 +554,18 @@ static int msm_drm_display_thread_create(struct sched_param param,
 	 * this priority was found during empiric testing to have appropriate
 	 * realtime scheduling to process display updates and interact with
 	 * other real time and normal priority task
+	 *
+	 * crtc_commit, crtc_event and pp_event below are all pinned to
+	 * cpu_prime_mask by kthread_run_perf_critical() and all run at this
+	 * priority, so they compete with each other. Under SCHED_FIFO a thread
+	 * that stays runnable (a burst of commits, a panning animation) blocks
+	 * its peers until it sleeps by itself, which is exactly the head of
+	 * line blocking we want to avoid for frame_done handling. Use SCHED_RR
+	 * instead so same priority peers round robin every RR_TIMESLICE while
+	 * still keeping strict separation from every lower priority.
+	 * task_tick_rt() only requeues when another runnable thread exists at
+	 * the same priority, so a worker that owns its priority level pays
+	 * nothing for the round robin.
 	 */
 	param.sched_priority = 16;
 	for (i = 0; i < priv->num_crtcs; i++) {
@@ -568,7 +580,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 				&priv->disp_thread[i].worker,
 				"crtc_commit:%d", priv->disp_thread[i].crtc_id);
 		ret = sched_setscheduler(priv->disp_thread[i].thread,
-							SCHED_FIFO, &param);
+							SCHED_RR, &param);
 		if (ret)
 			pr_warn("display thread priority update failed: %d\n",
 									ret);
@@ -595,7 +607,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 		 * failure at crtc commit level.
 		 */
 		ret = sched_setscheduler(priv->event_thread[i].thread,
-							SCHED_FIFO, &param);
+							SCHED_RR, &param);
 		if (ret)
 			pr_warn("display event thread priority update failed: %d\n",
 									ret);
@@ -635,7 +647,7 @@ static int msm_drm_display_thread_create(struct sched_param param,
 			kthread_worker_fn, &priv->pp_event_worker, "pp_event");
 
 	ret = sched_setscheduler(priv->pp_event_thread,
-						SCHED_FIFO, &param);
+						SCHED_RR, &param);
 	if (ret)
 		pr_warn("pp_event thread priority update failed: %d\n",
 								ret);

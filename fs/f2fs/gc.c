@@ -1779,7 +1779,7 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 {
 	int gc_type = gc_control->init_gc_type;
 	unsigned int segno = gc_control->victim_segno;
-	int sec_freed = 0, seg_freed = 0, total_freed = 0;
+	int sec_freed = 0, seg_freed = 0, total_freed = 0, total_sec_freed = 0;
 	int ret = 0;
 	struct cp_control cpc;
 	struct gc_inode_list gc_list = {
@@ -1799,8 +1799,8 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 				prefree_segments(sbi));
 
 	cpc.reason = __get_cp_reason(sbi);
-	sbi->skipped_gc_rwsem = 0;
 gc_more:
+	sbi->skipped_gc_rwsem = 0;
 	if (unlikely(!(sbi->sb->s_flags & SB_ACTIVE))) {
 		ret = -EINVAL;
 		goto stop;
@@ -1820,6 +1820,8 @@ gc_more:
 			ret = f2fs_write_checkpoint(sbi, &cpc);
 			if (ret)
 				goto stop;
+			/* Reset due to checkpoint */
+			sec_freed = 0;
 		}
 		if (has_not_enough_free_secs(sbi, 0, 0))
 			gc_type = FG_GC;
@@ -1846,8 +1848,10 @@ retry:
 				gc_control->should_migrate_blocks);
 	total_freed += seg_freed;
 
-	if (seg_freed == f2fs_usable_segs_in_sec(sbi, segno))
+	if (seg_freed == f2fs_usable_segs_in_sec(sbi, segno)) {
 		sec_freed++;
+		total_sec_freed++;
+	}
 
 	if (gc_type == FG_GC)
 		sbi->cur_victim_sec = NULL_SEGNO;
@@ -1855,7 +1859,8 @@ retry:
 	if (gc_control->init_gc_type == FG_GC ||
 	    !has_not_enough_free_secs(sbi,
 				(gc_type == FG_GC) ? sec_freed : 0, 0)) {
-		if (gc_type == FG_GC && sec_freed < gc_control->nr_free_secs)
+		if (gc_type == FG_GC &&
+				total_sec_freed < gc_control->nr_free_secs)
 			goto go_gc_more;
 		goto stop;
 	}
@@ -1878,6 +1883,8 @@ retry:
 		ret = f2fs_write_checkpoint(sbi, &cpc);
 		if (ret)
 			goto stop;
+		/* Reset due to checkpoint */
+		sec_freed = 0;
 	}
 go_gc_more:
 	segno = NULL_SEGNO;
@@ -1890,7 +1897,7 @@ stop:
 	if (gc_type == FG_GC)
 		f2fs_unpin_all_sections(sbi, true);
 
-	trace_f2fs_gc_end(sbi->sb, ret, total_freed, sec_freed,
+	trace_f2fs_gc_end(sbi->sb, ret, total_freed, total_sec_freed,
 				get_pages(sbi, F2FS_DIRTY_NODES),
 				get_pages(sbi, F2FS_DIRTY_DENTS),
 				get_pages(sbi, F2FS_DIRTY_IMETA),
@@ -1904,7 +1911,7 @@ stop:
 	put_gc_inode(&gc_list);
 
 	if (gc_control->err_gc_skipped && !ret)
-		ret = sec_freed ? 0 : -EAGAIN;
+		ret = total_sec_freed ? 0 : -EAGAIN;
 	return ret;
 }
 

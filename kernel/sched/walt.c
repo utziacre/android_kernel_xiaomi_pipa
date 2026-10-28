@@ -2769,7 +2769,6 @@ out:
 	    && grp->skip_min != prev_skip_min) {
 		if (grp->skip_min)
 			grp->start_ts = sched_clock();
-		sched_update_hyst_times();
 	}
 }
 

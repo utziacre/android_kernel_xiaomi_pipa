@@ -659,6 +659,18 @@ struct ravg {
 	u16 pred_demand_scaled;
 	u64 active_time;
 	u64 last_win_size;
+
+	/*
+	 * Frequent yielder tracking, see walt_do_sched_yield().
+	 *
+	 * 'yield_state' keeps a count of consecutive yields in the low bits
+	 * and a flag in bit 7 once a sleep was injected, 'yield_total_sleep_usec'
+	 * is how much of the current frame is still owed to the task and
+	 * 'yield_ts' is when it last yielded.
+	 */
+	u8 yield_state;
+	u32 yield_total_sleep_usec;
+	u64 yield_ts;
 };
 #else
 static inline void sched_exit(struct task_struct *p) { }

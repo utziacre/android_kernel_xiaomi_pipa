@@ -3382,6 +3382,24 @@ static void venus_hfi_core_work_handler(struct work_struct *work)
 		&hal_ctxt.dev_head, struct venus_hfi_device, list);
 	int num_responses = 0, i = 0;
 	u32 intr_status;
+	struct sched_param param = { .sched_priority = 1 };
+
+	/*
+	 * The firmware signals every frame completion here, and this thread
+	 * then has to take device->lock - the same lock the qbuf/dqbuf paths
+	 * take for their clock and bus votes.  As an ordinary CFS worker it is
+	 * queued behind whatever else the CPUs happen to be running, so the
+	 * completion that should have been handed to the client immediately
+	 * shows up a scheduling latency later, and a mutex hand-off from a CFS
+	 * holder gives priority inheritance nothing to work with.
+	 *
+	 * Run it the way the display commit threads run, but round-robin
+	 * rather than FIFO: a burst of responses is a queue with no bound on
+	 * how long draining it takes, and priority 1 is shared with the other
+	 * receive side threads.
+	 */
+	if (current->policy != SCHED_RR || current->rt_priority != 1)
+		sched_setscheduler(current, SCHED_RR, &param);
 
 	mutex_lock(&device->lock);
 	if (!__core_in_valid_state(device)) {
@@ -3410,6 +3428,20 @@ err_no_work:
 	mutex_unlock(&device->lock);
 
 	/*
+	 * Re-enable the line before running the callbacks.
+	 *
+	 * The callbacks hand the completion to the client, which is free to come
+	 * straight back in through qbuf/dqbuf and take device->lock again. The
+	 * interrupt was masked in the ISR, so keeping it masked until all of that
+	 * has settled means the firmware's next batch of messages waits for work
+	 * that has nothing to do with receiving them. Re-enabling here is safe:
+	 * this work is already running, so an interrupt arriving now only
+	 * re-queues it, and the packets are picked up on the next pass.
+	 */
+	if (!call_venus_op(device, watchdog, intr_status))
+		enable_irq(device->hal_data->irq);
+
+	/*
 	 * Issue the callbacks outside of the locked contex to preserve
 	 * re-entrancy.
 	 */
@@ -3426,10 +3458,6 @@ err_no_work:
 		}
 		device->callback(r->response_type, &r->response);
 	}
-
-	/* We need re-enable the irq which was disabled in ISR handler */
-	if (!call_venus_op(device, watchdog, intr_status))
-		enable_irq(device->hal_data->irq);
 
 	/*
 	 * XXX: Don't add any code beyond here.  Reacquiring locks after release

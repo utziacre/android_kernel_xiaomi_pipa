@@ -821,8 +821,13 @@ static int cds_ol_rx_thread(void *arg)
 #ifdef RX_THREAD_PRIORITY
 	struct sched_param scheduler_params = {0};
 
+	/*
+	 * The message loop has no bound on how long a batch takes.
+	 * Round-robin so it cannot hold priority 1 indefinitely while
+	 * the other receive threads at that priority wait.
+	 */
 	scheduler_params.sched_priority = 1;
-	sched_setscheduler(current, SCHED_FIFO, &scheduler_params);
+	sched_setscheduler(current, SCHED_RR, &scheduler_params);
 #else
 	set_user_nice(current, -1);
 #endif

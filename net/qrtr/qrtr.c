@@ -1215,8 +1215,12 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int net_id,
 		kfree(node);
 		return -ENOMEM;
 	}
+	/*
+	 * Drain the receive queue in round-robin chunks rather than holding
+	 * this priority for as long as messages keep arriving.
+	 */
 	if (rt)
-		sched_setscheduler(node->task, SCHED_FIFO, &param);
+		sched_setscheduler(node->task, SCHED_RR, &param);
 
 	mutex_init(&node->qrtr_tx_lock);
 	INIT_RADIX_TREE(&node->qrtr_tx_flow, GFP_KERNEL);

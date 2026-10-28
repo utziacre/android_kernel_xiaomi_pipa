@@ -1061,10 +1061,21 @@ static int exec_mmap(struct mm_struct *mm)
 		local_irq_enable();
 	lru_gen_use_mm(mm);
 	tsk->mm->vmacache_seqnum = 0;
-	lru_gen_add_mm(mm);
 	vmacache_flush(tsk);
 	preempt_enable_rt();
 	task_unlock(tsk);
+
+	/*
+	 * lru_gen_add_mm() takes mm_list->lock, a spinlock_t and therefore a
+	 * sleeping lock on PREEMPT_RT, so it cannot run in the region above
+	 * where preemption is disabled and interrupts are off.  A contended
+	 * lock there trips "scheduling while atomic" and leaves the task with
+	 * preemption disabled - which then turns every rt_spin_trylock() it
+	 * takes later on into a bogus in_irq() warning, and the next do_exit()
+	 * into "killing interrupt handler".
+	 */
+	lru_gen_add_mm(mm);
+
 	if (old_mm) {
 		mmap_read_unlock(old_mm);
 		BUG_ON(active_mm != old_mm);

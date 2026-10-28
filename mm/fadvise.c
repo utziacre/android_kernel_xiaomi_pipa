@@ -27,8 +27,12 @@
  * deactivate the pages and clear PG_Referenced.
  */
 
-static int generic_fadvise(struct file *file, loff_t offset, loff_t len,
-			   int advice)
+/*
+ * Exported to filesystems that install a ->fadvise() file operation and want
+ * the generic behaviour for the cases they do not handle themselves.
+ */
+int generic_fadvise(struct file *file, loff_t offset, loff_t len,
+		   int advice)
 {
 	struct inode *inode;
 	struct address_space *mapping;

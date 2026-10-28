@@ -9,17 +9,9 @@
 #define NR_LPM_LEVELS 8
 #define MAXSAMPLES 5
 #define CLUST_SMPL_INVLD_TIME 40000
-#define DEFAULT_PREMATURE_CNT 3
-#define DEFAULT_STDDEV 100
-#define DEFAULT_IPI_STDDEV 400
 #define DEFAULT_TIMER_ADD 100
-#define DEFAULT_IPI_TIMER_ADD 900
 #define TIMER_ADD_LOW 100
 #define TIMER_ADD_HIGH 1500
-#define STDDEV_LOW 100
-#define STDDEV_HIGH 1000
-#define PREMATURE_CNT_LOW 1
-#define PREMATURE_CNT_HIGH 5
 
 struct power_params {
 	uint32_t entry_latency;		/* Entry latency */
@@ -45,12 +37,7 @@ struct lpm_cpu {
 	int nlevels;
 	unsigned int psci_mode_shift;
 	unsigned int psci_mode_mask;
-	uint32_t ref_stddev;
-	uint32_t ref_premature_cnt;
-	uint32_t tmr_add;
 	bool lpm_prediction;
-	bool ipi_prediction;
-	uint64_t bias;
 	struct cpuidle_driver *drv;
 	struct lpm_cluster *parent;
 };

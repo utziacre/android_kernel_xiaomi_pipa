@@ -882,8 +882,21 @@ static int msm_vidc_get_extra_output_buff_count(struct msm_vidc_inst *inst)
 	}
 
 	if (is_decode_session(inst)) {
-		/* add 4 extra buffers for dcvs */
-		if (core->resources.dcvs)
+		/*
+		 * Add 4 extra buffers for dcvs - but only to a session that
+		 * actually runs dcvs. The buffers are there so the governor can
+		 * drop a clock level without starving the firmware; a session
+		 * that asked for low latency is pinned by construction (see
+		 * msm_dcvs_try_enable()) and the extra buffers then buy nothing
+		 * but queueing delay, four frames of it at 60fps.
+		 *
+		 * The condition has to spell the hint out rather than read
+		 * inst->clk_data.dcvs_mode: the counts are computed before
+		 * msm_dcvs_try_enable() runs for the first time.
+		 */
+		if (core->resources.dcvs &&
+		    !is_low_latency_hint(inst) &&
+		    !inst->clk_data.low_latency_mode)
 			extra_output_count = DCVS_DEC_EXTRA_OUTPUT_BUFFERS;
 		/*
 		 * Batch mode and HFR not supported for resolution greater than

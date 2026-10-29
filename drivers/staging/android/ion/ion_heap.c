@@ -95,6 +95,8 @@ int ion_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
 	return 0;
 }
 
+#define ION_HEAP_ZERO_BATCH	32
+
 static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 {
 	void *addr = vmap(pages, num, VM_MAP, pgprot);
@@ -107,26 +109,72 @@ static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 	return 0;
 }
 
+/*
+ * Zero an uncached buffer.  The pages are handed to devices with
+ * DMA_ATTR_SKIP_CPU_SYNC, so this has to go through a write-combine mapping;
+ * a cached zero would leave dirty lines the device never observes.
+ *
+ * Map the buffer in one piece instead of in 32 page batches.  Every vunmap()
+ * broadcasts a TLB invalidation to all CPUs, so a 20MB release used to cost
+ * 160 of them, and the deferred-free workqueue runs num_possible_cpus()
+ * workers in parallel.  A burst of video or camera releases therefore turned
+ * into a TLB shootdown storm that stalled unrelated threads -- audioserver
+ * being the one that shows up as multi-hundred-millisecond latency.
+ */
 static int ion_heap_sglist_zero(struct scatterlist *sgl, unsigned int nents,
 				pgprot_t pgprot)
 {
-	int p = 0;
-	int ret = 0;
 	struct sg_page_iter piter;
-	struct page *pages[32];
+	struct page *batch[ION_HEAP_ZERO_BATCH];
+	struct page **pages;
+	void *addr;
+	unsigned int count = 0;
+	unsigned int i = 0;
+	int ret = 0;
 
-	for_each_sg_page(sgl, &piter, nents, 0) {
-		pages[p++] = sg_page_iter_page(&piter);
-		if (p == ARRAY_SIZE(pages)) {
-			ret = ion_heap_clear_pages(pages, p, pgprot);
-			if (ret)
-				return ret;
-			p = 0;
-		}
+	for_each_sg_page(sgl, &piter, nents, 0)
+		count++;
+
+	if (!count)
+		return 0;
+
+	/* Small buffers never amortise a page array, keep the simple path. */
+	if (count <= ION_HEAP_ZERO_BATCH) {
+		for_each_sg_page(sgl, &piter, nents, 0)
+			batch[i++] = sg_page_iter_page(&piter);
+
+		return ion_heap_clear_pages(batch, count, pgprot);
 	}
-	if (p)
-		ret = ion_heap_clear_pages(pages, p, pgprot);
 
+	pages = kvmalloc_array(count, sizeof(*pages), GFP_KERNEL | __GFP_NOWARN);
+	if (!pages)
+		return -ENOMEM;
+
+	for_each_sg_page(sgl, &piter, nents, 0)
+		pages[i++] = sg_page_iter_page(&piter);
+
+	addr = vmap(pages, count, VM_MAP, pgprot);
+	if (addr) {
+		memset(addr, 0, PAGE_SIZE * count);
+		vunmap(addr);
+		goto out;
+	}
+
+	/*
+	 * The vmalloc area could not take the whole buffer at once.  Fall back
+	 * to batched mappings so the release still succeeds.
+	 */
+	for (i = 0; i < count; i += ION_HEAP_ZERO_BATCH) {
+		unsigned int num = min_t(unsigned int, ION_HEAP_ZERO_BATCH,
+					 count - i);
+
+		ret = ion_heap_clear_pages(pages + i, num, pgprot);
+		if (ret)
+			break;
+	}
+
+out:
+	kvfree(pages);
 	return ret;
 }
 

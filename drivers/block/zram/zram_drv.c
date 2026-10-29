@@ -1546,9 +1546,19 @@ compressed:
 	if (!entry) {
 		zcomp_stream_put(zram->comp);
 		atomic64_inc(&zram->stats.writestall);
+		/*
+		 * This path runs inside reclaim: shrink_page_list() ->
+		 * swap_writepage() -> here. Refusing the page is a normal
+		 * outcome then, and the count above already records it. What
+		 * must not happen is warn_alloc() pointing that out - it dumps
+		 * a stack and walks every zone to print Mem-Info, at the exact
+		 * moment when the allocator is out of pages and the caller is
+		 * a reclaim thread that is being slowed down by the printing.
+		 */
 		entry = zram_entry_alloc(zram, comp_len,
 				GFP_NOIO | __GFP_HIGHMEM |
-				__GFP_MOVABLE | __GFP_CMA);
+				__GFP_MOVABLE | __GFP_CMA |
+				__GFP_NOWARN);
 		if (entry)
 			goto compress_again;
 		return -ENOMEM;

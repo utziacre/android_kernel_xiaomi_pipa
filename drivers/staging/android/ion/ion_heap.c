@@ -14,6 +14,7 @@
 #include <uapi/linux/sched/types.h>
 #include <linux/scatterlist.h>
 #include <linux/vmalloc.h>
+#include <asm/page.h>
 #include "ion.h"
 
 void *ion_heap_map_kernel(struct ion_heap *heap,
@@ -181,14 +182,28 @@ out:
 int ion_heap_buffer_zero(struct ion_buffer *buffer)
 {
 	struct sg_table *table = buffer->sg_table;
-	pgprot_t pgprot;
+	struct sg_page_iter piter;
 
-	if (buffer->flags & ION_FLAG_CACHED)
-		pgprot = PAGE_KERNEL;
-	else
-		pgprot = pgprot_writecombine(PAGE_KERNEL);
+	/*
+	 * Uncached buffers have to be zeroed through a write-combine mapping:
+	 * they are mapped for DMA with DMA_ATTR_SKIP_CPU_SYNC, so leaving dirty
+	 * cache lines behind would hand a device stale contents.
+	 */
+	if (!(buffer->flags & ION_FLAG_CACHED))
+		return ion_heap_sglist_zero(table->sgl, table->nents,
+					    pgprot_writecombine(PAGE_KERNEL));
 
-	return ion_heap_sglist_zero(table->sgl, table->nents, pgprot);
+	/*
+	 * Cached buffers can be zeroed through the linear mapping instead.
+	 * clear_page() uses dc zva where it is available, so it does not read
+	 * the old contents first, and this does away with one vmap()/vunmap()
+	 * pair per 32 pages: every vunmap() broadcasts a TLB invalidation to
+	 * all CPUs, which is a very expensive way to free a buffer.
+	 */
+	for_each_sg_page(table->sgl, &piter, table->nents, 0)
+		clear_page(page_address(sg_page_iter_page(&piter)));
+
+	return 0;
 }
 
 int ion_heap_pages_zero(struct page *page, size_t size, pgprot_t pgprot)

@@ -8,7 +8,9 @@
 
 #include <linux/cpumask.h>
 #include <linux/miscdevice.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include "ion_secure_util.h"
 #include "ion_system_secure_heap.h"
@@ -453,6 +455,41 @@ static const struct dma_buf_ops ion_dma_buf_ops = {
 	.get_flags = ion_dma_buf_get_flags
 };
 
+static bool ion_camera_heap_present(void)
+{
+	struct ion_heap *heap;
+
+	plist_for_each_entry(heap, &ion_dev.heaps, node)
+		if (heap->id == ION_CAMERA_HEAP_ID)
+			return true;
+
+	return false;
+}
+
+/*
+ * Xiaomi's camera HAL allocates from the system heap and relies on the kernel
+ * to redirect those buffers to the dedicated camera heap.
+ */
+static unsigned int ion_redirect_camera_heap(unsigned int heap_id_mask)
+{
+	char task_comm[TASK_COMM_LEN];
+
+	if (heap_id_mask != ION_HEAP(ION_SYSTEM_HEAP_ID) &&
+	    heap_id_mask != (ION_HEAP(ION_SYSTEM_HEAP_ID) |
+			     ION_HEAP(ION_CAMERA_HEAP_ID)))
+		return heap_id_mask;
+
+	get_task_comm(task_comm, current->group_leader);
+	if (!strstr(task_comm, "provider@") &&
+	    !strstr(task_comm, ".android.camera"))
+		return heap_id_mask;
+
+	if (!ion_camera_heap_present())
+		return heap_id_mask;
+
+	return ION_HEAP(ION_CAMERA_HEAP_ID);
+}
+
 struct dma_buf *ion_alloc_dmabuf(size_t len, unsigned int heap_id_mask,
 				 unsigned int flags)
 {
@@ -465,6 +502,8 @@ struct dma_buf *ion_alloc_dmabuf(size_t len, unsigned int heap_id_mask,
 	len = PAGE_ALIGN(len);
 	if (!len)
 		return ERR_PTR(-EINVAL);
+
+	heap_id_mask = ion_redirect_camera_heap(heap_id_mask);
 
 	plist_for_each_entry(heap, &idev->heaps, node) {
 		if (BIT(heap->id) & heap_id_mask) {

@@ -5028,7 +5028,7 @@ static void nuvolta_1665_init_detect_work(struct work_struct *work)
 
 extern char *saved_command_line;
 
-static int get_cmdline(struct nuvolta_1665_chg *chip)
+static int mi_get_cmdline(struct nuvolta_1665_chg *chip)
 {
 	if (strnstr(saved_command_line,
 		    "androidboot.mode=", strlen(saved_command_line))) {
@@ -5212,7 +5212,7 @@ static int nuvolta_1665_probe(struct i2c_client *client,
 	} else
 		nuvolta_err("%s: hall4 gpio not provided\n", __func__);
 
-	get_cmdline(chip);
+	mi_get_cmdline(chip);
 #ifndef CONFIG_FACTORY_BUILD
 	if (!chip->power_off_mode)
 		schedule_delayed_work(&chip->probe_fw_download_work, 10 * HZ);

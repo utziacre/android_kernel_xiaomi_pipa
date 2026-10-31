@@ -555,17 +555,22 @@ void ion_add_heap(struct ion_device *idev, struct ion_heap *heap)
 
 	if (heap->flags & ION_HEAP_FLAG_DEFER_FREE) {
 		/*
-		 * max_active is a global limit for an unbound workqueue, so the
-		 * limit of 1 that keeps the frees from occupying every CPU also
-		 * serialises them for the whole system: everything queues behind
-		 * a single worker and the pages only come back to the allocator
-		 * much later than they could.  A CPU runs one thread at a time,
-		 * so allowing max_active frees at once still means at most one
-		 * free per CPU, but a burst of releases can drain in parallel
-		 * instead of one by one.
+		 * max_active is a global limit for an unbound workqueue, not a
+		 * per-CPU one: on this non-NUMA system the workqueue owns a
+		 * single pool_workqueue, so a max_active of 1 serialises the
+		 * frees for the whole system and a burst of releases keeps its
+		 * pages away from the allocator far longer than it has to.
+		 *
+		 * The ceiling is still the number of CPUs an unbound worker can
+		 * actually run on.  workqueue_init_early() seeds
+		 * wq_unbound_cpumask from cpu_lp_mask, which this kernel sets to
+		 * the little cluster (CONFIG_LITTLE_CPU_MASK), so the big and
+		 * prime cores never execute an unbound worker at all.  Asking
+		 * for more than that would only queue work up inside the pool.
 		 */
 		heap->wq = alloc_workqueue("%s", WQ_UNBOUND | WQ_MEM_RECLAIM,
-					   num_possible_cpus(), heap->name);
+					   cpumask_weight(cpu_lp_mask),
+					   heap->name);
 		BUG_ON(!heap->wq);
 	}
 

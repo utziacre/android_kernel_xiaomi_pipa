@@ -117,10 +117,10 @@ static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
  *
  * Map the buffer in one piece instead of in 32 page batches.  Every vunmap()
  * broadcasts a TLB invalidation to all CPUs, so a 20MB release used to cost
- * 160 of them, and the deferred-free workqueue runs num_possible_cpus()
- * workers in parallel.  A burst of video or camera releases therefore turned
- * into a TLB shootdown storm that stalled unrelated threads -- audioserver
- * being the one that shows up as multi-hundred-millisecond latency.
+ * 160 of them, and the deferred-free workqueue drains several of them in
+ * parallel.  A burst of video or camera releases therefore turned into a TLB
+ * shootdown storm that stalled unrelated threads -- audioserver being the one
+ * that shows up as multi-hundred-millisecond latency.
  */
 static int ion_heap_sglist_zero(struct scatterlist *sgl, unsigned int nents,
 				pgprot_t pgprot)

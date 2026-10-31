@@ -14,6 +14,7 @@
 #include <uapi/linux/sched/types.h>
 #include <linux/scatterlist.h>
 #include <linux/vmalloc.h>
+#include <asm/cacheflush.h>
 #include <asm/page.h>
 #include "ion.h"
 
@@ -117,10 +118,11 @@ static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
  *
  * Map the buffer in one piece instead of in 32 page batches.  Every vunmap()
  * broadcasts a TLB invalidation to all CPUs, so a 20MB release used to cost
- * 160 of them, and the deferred-free workqueue drains several of them in
- * parallel.  A burst of video or camera releases therefore turned into a TLB
- * shootdown storm that stalled unrelated threads -- audioserver being the one
- * that shows up as multi-hundred-millisecond latency.
+ * 160 of them, and the deferred-free workqueue can drain one release per
+ * little CPU in parallel.  A burst of video or camera releases therefore
+ * turned into a TLB shootdown storm that stalled unrelated threads --
+ * audioserver being the one that shows up as multi-hundred-millisecond
+ * latency.
  */
 static int ion_heap_sglist_zero(struct scatterlist *sgl, unsigned int nents,
 				pgprot_t pgprot)
@@ -199,9 +201,19 @@ int ion_heap_buffer_zero(struct ion_buffer *buffer)
 	 * the old contents first, and this does away with one vmap()/vunmap()
 	 * pair per 32 pages: every vunmap() broadcasts a TLB invalidation to
 	 * all CPUs, which is a very expensive way to free a buffer.
+	 *
+	 * Push the zeros out to memory afterwards.  clear_page() only dirties
+	 * the cache, and these pages go straight back to the pool; a client
+	 * that maps the recycled page to a non-coherent device would otherwise
+	 * read whatever the previous owner left in DRAM.
 	 */
-	for_each_sg_page(table->sgl, &piter, table->nents, 0)
-		clear_page(page_address(sg_page_iter_page(&piter)));
+	for_each_sg_page(table->sgl, &piter, table->nents, 0) {
+		struct page *page = sg_page_iter_page(&piter);
+		void *addr = page_address(page);
+
+		clear_page(addr);
+		__flush_dcache_area(addr, PAGE_SIZE);
+	}
 
 	return 0;
 }

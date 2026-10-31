@@ -122,9 +122,8 @@ struct ion_vma_list {
  * @size:		size of the buffer
  * @priv_virt:		private data to the buffer representable as
  *			a void *
- * @lock:		protects the buffers cnt fields
- * @kmap_cnt:		number of times the buffer is mapped to the kernel
- * @vaddr:		the kernel mapping if kmap_cnt is not zero
+ * @vaddr:		the kernel mapping, created on demand and torn down when
+ *			the buffer is freed
  * @sg_table:		the sg table for the buffer if dmap_cnt is not zero
  * @vmas:		list of vma's mapping this buffer
  */
@@ -132,7 +131,6 @@ struct ion_dma_buf_attachment;
 struct ion_buffer {
 	struct ion_heap *heap;
 	struct sg_table *sg_table;
-	struct mutex kmap_lock;
 	struct work_struct free;
 	struct ion_dma_buf_attachment *attachments;
 	struct list_head map_freelist;
@@ -142,7 +140,6 @@ struct ion_buffer {
 	unsigned int flags;
 	unsigned int private_flags;
 	size_t size;
-	int kmap_refcount;
 	struct msm_iommu_data iommu_data;
 };
 

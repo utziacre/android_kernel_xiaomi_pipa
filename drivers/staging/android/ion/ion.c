@@ -50,7 +50,7 @@ static void ion_buffer_free_work(struct work_struct *work)
 		sg_free_table(&a->table);
 		kfree(a);
 	}
-	if (buffer->kmap_refcount)
+	if (buffer->vaddr)
 		heap->ops->unmap_kernel(heap, buffer);
 	heap->ops->free(buffer);
 	kfree(buffer);
@@ -70,7 +70,6 @@ static struct ion_buffer *ion_buffer_create(struct ion_heap *heap, size_t len,
 		.flags = flags,
 		.heap = heap,
 		.size = len,
-		.kmap_lock = __MUTEX_INITIALIZER(buffer->kmap_lock),
 		.free = __WORK_INITIALIZER(buffer->free, ion_buffer_free_work),
 		.map_freelist = LIST_HEAD_INIT(buffer->map_freelist),
 		.freelist_lock = __SPIN_LOCK_UNLOCKED(buffer->freelist_lock),
@@ -184,43 +183,49 @@ static void *ion_dma_buf_vmap(struct dma_buf *dmabuf)
 	if (!heap->ops->map_kernel)
 		return ERR_PTR(-ENODEV);
 
-	mutex_lock(&buffer->kmap_lock);
-	if (buffer->kmap_refcount) {
-		vaddr = buffer->vaddr;
-		buffer->kmap_refcount++;
-	} else {
+	/*
+	 * No lock here.  dma_buf_vmap() is the only caller of this op and it
+	 * holds dmabuf->lock, so only one thread can ever be in the mapping
+	 * branch, and it refcounts the callers itself.  The mapping is created
+	 * once and then lives until the buffer is freed.
+	 */
+	if (!buffer->vaddr) {
 		vaddr = heap->ops->map_kernel(heap, buffer);
-		if (IS_ERR_OR_NULL(vaddr)) {
-			vaddr = ERR_PTR(-EINVAL);
-		} else {
-			buffer->vaddr = vaddr;
-			buffer->kmap_refcount++;
-		}
-	}
-	mutex_unlock(&buffer->kmap_lock);
+		if (IS_ERR_OR_NULL(vaddr))
+			return ERR_PTR(-EINVAL);
 
-	return vaddr;
+		buffer->vaddr = vaddr;
+	}
+
+	return buffer->vaddr;
 }
 
 static void ion_dma_buf_vunmap(struct dma_buf *dmabuf, void *vaddr)
 {
-	struct ion_buffer *buffer = container_of(dmabuf->priv, typeof(*buffer),
-						 iommu_data);
-	struct ion_heap *heap = buffer->heap;
-
-	mutex_lock(&buffer->kmap_lock);
-	if (!--buffer->kmap_refcount)
-		heap->ops->unmap_kernel(heap, buffer);
-	mutex_unlock(&buffer->kmap_lock);
+	/*
+	 * Keep the mapping alive until ion_buffer_free_work() tears it down.
+	 *
+	 * unmap_kernel() is a vunmap(): it pulls the range back out of the
+	 * global vmalloc space and broadcasts a TLB invalidation to every CPU.
+	 * Clients map and unmap the same buffer over and over, so paying that on
+	 * every last reference turned into a system wide shootdown storm for a
+	 * mapping that was about to be created again.  The mapping is instead
+	 * dropped once, when the buffer itself goes away.
+	 */
 }
 
 static void *ion_dma_buf_kmap(struct dma_buf *dmabuf, unsigned long offset)
 {
 	void *vaddr;
 
-	vaddr = ion_dma_buf_vmap(dmabuf);
-	if (IS_ERR(vaddr))
-		return vaddr;
+	/*
+	 * dma_buf_kmap() has no locking of its own, so ask the core for the
+	 * mapping instead of calling ion_dma_buf_vmap() directly: dma_buf_vmap()
+	 * serialises against itself and against dma_buf_vunmap().
+	 */
+	vaddr = dma_buf_vmap(dmabuf);
+	if (!vaddr)
+		return NULL;
 
 	return vaddr + offset * PAGE_SIZE;
 }
@@ -228,7 +233,10 @@ static void *ion_dma_buf_kmap(struct dma_buf *dmabuf, unsigned long offset)
 static void ion_dma_buf_kunmap(struct dma_buf *dmabuf, unsigned long offset,
 			       void *ptr)
 {
-	ion_dma_buf_vunmap(dmabuf, NULL);
+	if (!ptr)
+		return;
+
+	dma_buf_vunmap(dmabuf, ptr - offset * PAGE_SIZE);
 }
 
 static int ion_dup_sg_table(struct sg_table *dst, struct sg_table *src)

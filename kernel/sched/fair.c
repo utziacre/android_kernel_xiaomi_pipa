@@ -7690,7 +7690,6 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	unsigned long best_active_util = ULONG_MAX;
 	unsigned long best_active_cuml_util = ULONG_MAX;
 	unsigned long best_idle_cuml_util = ULONG_MAX;
-	bool prefer_idle = schedtune_prefer_idle(p);
 	bool boosted;
 	/* Initialise with deepest possible cstate (INT_MAX) */
 	int shallowest_idle_cstate = INT_MAX;
@@ -7714,13 +7713,18 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	 * energy efficient CPU candidate, thus requiring to minimise
 	 * target_capacity. For these cases target_capacity is already
 	 * initialized to ULONG_MAX.
-	 * However, for prefer_idle and boosted tasks we look for a high
-	 * performance CPU, thus requiring to maximise target_capacity. In this
-	 * case we initialise target_capacity to 0.
+	 * However, for boosted tasks we look for a high performance CPU, thus
+	 * requiring to maximise target_capacity. In this case we initialise
+	 * target_capacity to 0.
+	 *
+	 * Latency sensitivity is deliberately not consulted here: it is a
+	 * cgroup wide flag, so honouring it would let one attribute promote
+	 * every task of the group onto the higher capacity cluster regardless
+	 * of how much work each of them has. The task's own uclamp/boost
+	 * request already carries the same intent at a per task granularity.
 	 */
-	prefer_idle = uclamp_latency_sensitive(p);
 	boosted = fbt_env->boosted || uclamp_boosted(p);
-	if (prefer_idle && boosted)
+	if (boosted)
 		target_capacity = 0;
 
 	if (fbt_env->strict_max || p->in_iowait)
@@ -7849,13 +7853,13 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 			 * without waiting for an OPP chance.
 			 *
 			 * The following code path is the only one in the CPUs
-			 * exploration loop which is always used by
-			 * prefer_idle tasks. It exits the loop with wither a
+			 * exploration loop which is always used by boosted
+			 * tasks. It exits the loop with wither a
 			 * best_active_cpu or a target_cpu which should
-			 * represent an optimal choice for latency sensitive
-			 * tasks.
+			 * represent an optimal choice for tasks that asked
+			 * for more performance.
 			 */
-			if (prefer_idle) {
+			if (boosted) {
 
 				/*
 				 * Case A.1: IDLE CPU
@@ -8053,7 +8057,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 		 * And always visit higher capacity group, if solo cpu group
 		 * is not in idle.
 		 */
-		if (!prefer_idle && !boosted &&
+		if (!boosted &&
 			((target_cpu != -1 && (sg->group_weight > 1 ||
 			 !next_group_higher_cap)) ||
 			 best_idle_cpu != -1) &&
@@ -8064,22 +8068,15 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 			break;
 
 		/*
-		 * if we are in prefer_idle and have found an idle cpu,
-		 * break from searching more groups based on the stune.boost and
-		 * group cpu capacity. For !prefer_idle && boosted case, don't
+		 * If a boosted task found an idle cpu, break from searching more
+		 * groups based on the stune.boost and group cpu capacity. Don't
 		 * iterate lower capacity CPUs unless the task can't be
 		 * accommodated in the higher capacity CPUs.
 		 */
-		if ((prefer_idle && best_idle_cpu != -1) ||
-		    (boosted && (best_idle_cpu != -1 || target_cpu != -1 ||
-		     (fbt_env->strict_max && most_spare_cap_cpu != -1)))) {
-			if (boosted) {
-				if (!next_group_higher_cap)
-					break;
-			} else {
-				if (next_group_higher_cap)
-					break;
-			}
+		if (boosted && (best_idle_cpu != -1 || target_cpu != -1 ||
+		    (fbt_env->strict_max && most_spare_cap_cpu != -1))) {
+			if (!next_group_higher_cap)
+				break;
 		}
 
 	} while (sg = sg->next, sg != start_sd->groups);
@@ -8089,13 +8086,13 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 				fbt_env, boosted);
 
 	/*
-	 * For non latency sensitive tasks, cases B and C in the previous loop,
+	 * For non boosted tasks, cases B and C in the previous loop,
 	 * we pick the best IDLE CPU only if we was not able to find a target
 	 * ACTIVE CPU.
 	 *
 	 * Policies priorities:
 	 *
-	 * - prefer_idle tasks:
+	 * - boosted tasks:
 	 *
 	 *   a) IDLE CPU available: best_idle_cpu
 	 *   b) ACTIVE CPU where task fits and has the bigger maximum spare
@@ -8103,23 +8100,23 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	 *   c) ACTIVE CPU with less contention due to other tasks
 	 *      (i.e. best_active_cpu)
 	 *
-	 * - NON prefer_idle tasks:
+	 * - NON boosted tasks:
 	 *
 	 *   a) ACTIVE CPU: target_cpu
 	 *   b) IDLE CPU: best_idle_cpu
 	 */
 
-	if (prefer_idle && (best_idle_cpu != -1)) {
+	if (boosted && (best_idle_cpu != -1)) {
 		target_cpu = best_idle_cpu;
 		goto target;
 	}
 
 	if (target_cpu == -1)
-		target_cpu = prefer_idle
+		target_cpu = boosted
 			? best_active_cpu
 			: best_idle_cpu;
 	else
-		backup_cpu = prefer_idle
+		backup_cpu = boosted
 		? best_active_cpu
 		: best_idle_cpu;
 
@@ -8141,7 +8138,7 @@ target:
 	}
 
 out:
-	trace_sched_find_best_target(p, prefer_idle, min_util, start_cpu,
+	trace_sched_find_best_target(p, boosted, min_util, start_cpu,
 				     best_idle_cpu, best_active_cpu,
 				     most_spare_cap_cpu,
 				     target_cpu, backup_cpu);
@@ -8334,7 +8331,6 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 {
 	int highest_spare_cap_cpu = prev_cpu, best_idle_cpu = -1;
 	unsigned long spare_cap, max_spare_cap, util, cpu_cap;
-	bool prefer_idle = uclamp_latency_sensitive(p);
 	bool boosted = uclamp_boosted(p);
 	unsigned long target_cap = boosted ? 0 : ULONG_MAX;
 	unsigned long highest_spare_cap = 0;
@@ -8393,7 +8389,7 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 				max_spare_cap_cpu = cpu;
 			}
 
-			if (!prefer_idle)
+			if (!boosted)
 				continue;
 
 			if (idle_cpu(cpu)) {
@@ -8417,11 +8413,11 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 			}
 		}
 
-		if (!prefer_idle && max_spare_cap_cpu >= 0)
+		if (!boosted && max_spare_cap_cpu >= 0)
 			cpumask_set_cpu(max_spare_cap_cpu, cpus);
 	}
 
-	if (!prefer_idle)
+	if (!boosted)
 		return;
 
 	if (best_idle_cpu >= 0)
@@ -8608,9 +8604,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 
 	/* If there is only one sensible candidate, select it now. */
 	cpu = cpumask_first(candidates);
-	if (weight == 1 && ((uclamp_latency_sensitive(p) &&
-			    (available_idle_cpu(cpu) || 
-			    sched_idle_cpu(cpu))) ||
+	if (weight == 1 && ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) ||
 			    (cpu == prev_cpu))) {
 		best_energy_cpu = cpu;
 		goto unlock;

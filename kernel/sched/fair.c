@@ -7737,7 +7737,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	if (((capacity_orig_of(prev_cpu) == capacity_orig_of(start_cpu)) ||
 		asym_cap_siblings(prev_cpu, start_cpu)) &&
 		!cpu_isolated(prev_cpu) && cpu_online(prev_cpu) &&
-		(available_idle_cpu(i) || sched_idle_cpu(i))) {
+		(available_idle_cpu(prev_cpu) || sched_idle_cpu(prev_cpu))) {
 
 		if (idle_get_state_idx(cpu_rq(prev_cpu)) <= 1) {
 			target_cpu = prev_cpu;

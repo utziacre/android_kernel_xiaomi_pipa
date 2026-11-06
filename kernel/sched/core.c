@@ -1419,9 +1419,21 @@ unsigned int uclamp_task(struct task_struct *p)
 	return util;
 }
 
+/*
+ * A uclamp_min request on its own only states that the task wants a minimum
+ * performance level; it says nothing about how much work the task actually
+ * has. Treating every task with a non-zero uclamp_min as boosted lets tiny
+ * tasks pin the big cluster and keep it out of its idle states, which shows
+ * up as wakeup latency jitter for everyone else.
+ *
+ * Filter on the same utilisation floor the conservative boost uses, so a
+ * uclamp_min request only promotes a task once it is heavy enough to make
+ * use of the extra capacity.
+ */
 bool uclamp_boosted(struct task_struct *p)
 {
-	return uclamp_eff_value(p, UCLAMP_MIN) > 0;
+	return uclamp_eff_value(p, UCLAMP_MIN) > 0 &&
+	       task_util(p) > sysctl_sched_min_task_util_for_boost;
 }
 
 bool uclamp_latency_sensitive(struct task_struct *p)

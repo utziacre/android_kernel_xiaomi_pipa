@@ -8104,21 +8104,31 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	 *
 	 *   a) ACTIVE CPU: target_cpu
 	 *   b) IDLE CPU: best_idle_cpu
-	 */
+         *
+         * The idle CPU is also preferred for a non boosted task when it is
+         * sitting in wfi. On this platform the only CPU idle states are wfi,
+         * which exits in about 43us, and rail-pc, which costs 531us on the
+         * little cluster and 1061us on the big one. A CPU in wfi can start
+         * the task almost immediately and the task avoids queueing behind
+         * whatever is already on the active CPU, while pulling a CPU out of
+         * rail-pc costs more than waiting for the active one and also breaks
+         * the cluster wide idle state. Keep the latter on the backup path.
+         */
 
-	if (boosted && (best_idle_cpu != -1)) {
-		target_cpu = best_idle_cpu;
-		goto target;
-	}
+        if (best_idle_cpu != -1 &&
+            (boosted || shallowest_idle_cstate <= 0)) {
+                target_cpu = best_idle_cpu;
+                goto target;
+        }
 
-	if (target_cpu == -1)
-		target_cpu = boosted
-			? best_active_cpu
-			: best_idle_cpu;
-	else
-		backup_cpu = boosted
-		? best_active_cpu
-		: best_idle_cpu;
+        if (target_cpu == -1)
+                target_cpu = boosted
+                        ? best_active_cpu
+                        : best_idle_cpu;
+        else
+                backup_cpu = boosted
+                ? best_active_cpu
+                : best_idle_cpu;
 
 	if (target_cpu == -1 && most_spare_cap_cpu != -1 &&
 		/* ensure we use active cpu for active migration */

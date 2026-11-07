@@ -183,6 +183,7 @@ unsigned int munlock_vma_page(struct page *page)
 {
 	int nr_pages;
 	struct zone *zone = page_zone(page);
+	struct lruvec *lruvec;
 
 	/* For try_to_munlock() and to serialize with page migration */
 	BUG_ON(!PageLocked(page));
@@ -194,7 +195,8 @@ unsigned int munlock_vma_page(struct page *page)
 	 * might otherwise copy PageMlocked to part of the tail pages before
 	 * we clear it in the head page. It also stabilizes hpage_nr_pages().
 	 */
-	spin_lock_irq(zone_lru_lock(zone));
+	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+	spin_lock_irq(&lruvec->lru_lock);
 
 	if (!TestClearPageMlocked(page)) {
 		/* Potentially, PTE-mapped THP: do not skip the rest PTEs */
@@ -206,14 +208,14 @@ unsigned int munlock_vma_page(struct page *page)
 	__mod_zone_page_state(zone, NR_MLOCK, -nr_pages);
 
 	if (__munlock_isolate_lru_page(page, true)) {
-		spin_unlock_irq(zone_lru_lock(zone));
+		spin_unlock_irq(&lruvec->lru_lock);
 		__munlock_isolated_page(page);
 		goto out;
 	}
 	__munlock_isolation_failed(page);
 
 unlock_out:
-	spin_unlock_irq(zone_lru_lock(zone));
+	spin_unlock_irq(&lruvec->lru_lock);
 
 out:
 	return nr_pages - 1;
@@ -298,21 +300,31 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
 	pagevec_init(&pvec_putback);
 
 	/* Phase 1: page isolation */
-	spin_lock_irq(zone_lru_lock(zone));
 	for (i = 0; i < nr; i++) {
 		struct page *page = pvec->pages[i];
+		struct lruvec *lruvec;
+		bool was_mlocked, isolated = false;
 
-		if (TestClearPageMlocked(page)) {
+		lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+		spin_lock_irq(&lruvec->lru_lock);
+
+		was_mlocked = TestClearPageMlocked(page);
+		if (was_mlocked) {
 			/*
 			 * We already have pin from follow_page_mask()
 			 * so we can spare the get_page() here.
 			 */
-			if (__munlock_isolate_lru_page(page, false))
-				continue;
-			else
-				__munlock_isolation_failed(page);
+			isolated = __munlock_isolate_lru_page(page, false);
 		} else {
 			delta_munlocked++;
+		}
+
+		spin_unlock_irq(&lruvec->lru_lock);
+
+		if (was_mlocked) {
+			if (isolated)
+				continue;
+			__munlock_isolation_failed(page);
 		}
 
 		/*
@@ -325,7 +337,6 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
 		pvec->pages[i] = NULL;
 	}
 	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
-	spin_unlock_irq(zone_lru_lock(zone));
 
 	/* Now we can release pins of pages that we are not munlocking */
 	pagevec_release(&pvec_putback);

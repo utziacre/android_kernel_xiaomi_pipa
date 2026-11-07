@@ -31,7 +31,7 @@
 static struct page *page_idle_get_page(unsigned long pfn)
 {
 	struct page *page;
-	struct zone *zone;
+	struct lruvec *lruvec;
 
 	if (!pfn_valid(pfn))
 		return NULL;
@@ -41,13 +41,13 @@ static struct page *page_idle_get_page(unsigned long pfn)
 	    !get_page_unless_zero(page))
 		return NULL;
 
-	zone = page_zone(page);
-	spin_lock_irq(zone_lru_lock(zone));
+	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+	spin_lock_irq(&lruvec->lru_lock);
 	if (unlikely(!PageLRU(page))) {
 		put_page(page);
 		page = NULL;
 	}
-	spin_unlock_irq(zone_lru_lock(zone));
+	spin_unlock_irq(&lruvec->lru_lock);
 	return page;
 }
 

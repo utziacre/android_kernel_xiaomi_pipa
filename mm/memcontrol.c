@@ -2395,40 +2395,47 @@ static void cancel_charge(struct mem_cgroup *memcg, unsigned int nr_pages)
 	css_put_many(&memcg->css, nr_pages);
 }
 
-static void lock_page_lru(struct page *page, int *isolated)
+static struct lruvec *lock_page_lru(struct page *page, int *isolated,
+				    unsigned long *flags)
 {
-	struct zone *zone = page_zone(page);
+	struct lruvec *lruvec;
 
-	spin_lock_irq(zone_lru_lock(zone));
+	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+	spin_lock_irqsave(&lruvec->lru_lock, *flags);
 	if (PageLRU(page)) {
-		struct lruvec *lruvec;
-
-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
 		ClearPageLRU(page);
 		del_page_from_lru_list(page, lruvec);
 		*isolated = 1;
 	} else
 		*isolated = 0;
+
+	return lruvec;
 }
 
-static void unlock_page_lru(struct page *page, int isolated)
+/*
+ * The page is off-LRU while its memcg is updated, so it has to go back on the
+ * LRU of the memcg it belongs to now, not the one @lruvec was taken for.
+ */
+static void unlock_page_lru(struct page *page, struct lruvec *lruvec,
+			    int isolated, unsigned long flags)
 {
-	struct zone *zone = page_zone(page);
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 
 	if (isolated) {
-		struct lruvec *lruvec;
-
-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
+		lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+		spin_lock_irqsave(&lruvec->lru_lock, flags);
 		VM_BUG_ON_PAGE(PageLRU(page), page);
 		SetPageLRU(page);
 		add_page_to_lru_list(page, lruvec);
+		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 	}
-	spin_unlock_irq(zone_lru_lock(zone));
 }
 
 static void commit_charge(struct page *page, struct mem_cgroup *memcg,
 			  bool lrucare)
 {
+	struct lruvec *lruvec = NULL;
+	unsigned long flags = 0;
 	int isolated;
 
 	VM_BUG_ON_PAGE(page_memcg(page), page);
@@ -2438,7 +2445,7 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg,
 	 * may already be on some other mem_cgroup's LRU.  Take care of it.
 	 */
 	if (lrucare)
-		lock_page_lru(page, &isolated);
+		lruvec = lock_page_lru(page, &isolated, &flags);
 
 	/*
 	 * Nobody should be changing or seriously looking at
@@ -2458,7 +2465,7 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg,
 	page->memcg_data = (unsigned long)memcg;
 
 	if (lrucare)
-		unlock_page_lru(page, isolated);
+		unlock_page_lru(page, lruvec, isolated, flags);
 }
 
 #ifdef CONFIG_MEMCG_KMEM
@@ -2741,7 +2748,7 @@ void __memcg_kmem_uncharge_page(struct page *page, int order)
 
 /*
  * Because tail pages are not marked as "used", set it. We're under
- * zone_lru_lock and migration entries setup in all page mappings.
+ * lruvec->lru_lock and migration entries setup in all page mappings.
  */
 void mem_cgroup_split_huge_fixup(struct page *head)
 {

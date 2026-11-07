@@ -785,6 +785,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 	struct zone *zone = cc->zone;
 	unsigned long nr_scanned = 0, nr_isolated = 0;
 	struct lruvec *lruvec;
+	struct lruvec *locked_lruvec = NULL;
 	unsigned long flags = 0;
 	bool locked = false;
 	struct page *page = NULL, *valid_page = NULL;
@@ -847,8 +848,8 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		 * a fatal signal is pending.
 		 */
 		if (!(low_pfn % SWAP_CLUSTER_MAX)
-		    && compact_unlock_should_abort(zone_lru_lock(zone), flags,
-								&locked, cc)) {
+		    && compact_unlock_should_abort(locked ? &locked_lruvec->lru_lock : NULL,
+								flags, &locked, cc)) {
 			low_pfn = 0;
 			goto fatal_pending;
 		}
@@ -920,8 +921,8 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 			if (unlikely(__PageMovable(page)) &&
 					!PageIsolated(page)) {
 				if (locked) {
-					spin_unlock_irqrestore(zone_lru_lock(zone),
-									flags);
+					spin_unlock_irqrestore(&locked_lruvec->lru_lock,
+							       flags);
 					locked = false;
 				}
 
@@ -948,9 +949,20 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		if (!(cc->gfp_mask & __GFP_FS) && page_mapping(page))
 			goto isolate_fail;
 
+		/*
+		 * The lock covers one lruvec, so retake it when the page moved
+		 * to another memcg's lruvec.
+		 */
+		if (locked &&
+		    locked_lruvec != mem_cgroup_page_lruvec(page, page_pgdat(page))) {
+			spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
+			locked = false;
+		}
+
 		/* If we already hold the lock, we can skip some rechecking */
 		if (!locked) {
-			locked = compact_lock_irqsave(zone_lru_lock(zone),
+			locked_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+			locked = compact_lock_irqsave(&locked_lruvec->lru_lock,
 								&flags, cc);
 
 			/* Try get exclusive access under lock */
@@ -975,7 +987,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 			}
 		}
 
-		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
+		lruvec = locked_lruvec;
 
 		/* Try isolate the page */
 		if (__isolate_lru_page(page, isolate_mode) != 0)
@@ -1017,7 +1029,7 @@ isolate_fail:
 		 */
 		if (nr_isolated) {
 			if (locked) {
-				spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+				spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
 				locked = false;
 			}
 			putback_movable_pages(&cc->migratepages);
@@ -1044,7 +1056,7 @@ isolate_fail:
 
 isolate_abort:
 	if (locked)
-		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+		spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
 
 	/*
 	 * Updated the cached scanner pfn once the pageblock has been scanned

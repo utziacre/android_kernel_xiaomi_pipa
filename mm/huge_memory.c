@@ -2513,14 +2513,11 @@ static void __split_huge_page_tail(struct page *head, int tail,
 }
 
 static void __split_huge_page(struct page *page, struct list_head *list,
-		pgoff_t end, unsigned long flags, struct address_space *mapping)
+		pgoff_t end, unsigned long flags, struct address_space *mapping,
+		struct lruvec *lruvec)
 {
 	struct page *head = compound_head(page);
-	struct zone *zone = page_zone(head);
-	struct lruvec *lruvec;
 	int i;
-
-	lruvec = mem_cgroup_page_lruvec(head, zone->zone_pgdat);
 
 	/* complete memcg works before add pages to LRU */
 	mem_cgroup_split_huge_fixup(head);
@@ -2554,7 +2551,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
 		xa_unlock(&head->mapping->i_pages);
 	}
 
-	spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 
 	remap_page(head);
 
@@ -2706,6 +2703,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 	struct pglist_data *pgdata = NODE_DATA(page_to_nid(head));
 	struct anon_vma *anon_vma = NULL;
 	struct address_space *mapping = NULL;
+	struct lruvec *lruvec;
 	int extra_pins, ret;
 	bool mlocked;
 	unsigned long flags;
@@ -2774,7 +2772,8 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		lru_add_drain();
 
 	/* prevent PageLRU to go away from under us, and freeze lru stats */
-	spin_lock_irqsave(zone_lru_lock(page_zone(head)), flags);
+	lruvec = mem_cgroup_page_lruvec(head, page_pgdat(head));
+	spin_lock_irqsave(&lruvec->lru_lock, flags);
 
 	if (mapping) {
 		void **pslot;
@@ -2815,7 +2814,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 fail:
 		if (mapping)
 			xa_unlock(&mapping->i_pages);
-		spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
+		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 		remap_page(head);
 		ret = -EBUSY;
 	}

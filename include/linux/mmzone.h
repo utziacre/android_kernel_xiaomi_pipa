@@ -456,6 +456,11 @@ static inline void lru_gen_exit_memcg(struct mem_cgroup *memcg)
 #endif /* CONFIG_LRU_GEN */
 
 struct lruvec {
+	/*
+	 * Every lruvec has its own lock, so that reclaim of one memcg does
+	 * not serialise against reclaim of another one on the same node.
+	 */
+	spinlock_t			lru_lock;
 	struct list_head		lists[NR_LRU_LISTS];
 	struct zone_reclaim_stat	reclaim_stat;
 	/* Evictions & activations on the inactive file list */
@@ -944,7 +949,6 @@ typedef struct pglist_data {
 
 	/* Write-intensive fields used by page reclaim */
 	ZONE_PADDING(_pad1_)
-	spinlock_t		lru_lock;
 
 #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
 	/*
@@ -990,14 +994,52 @@ typedef struct pglist_data {
 
 #define node_start_pfn(nid)	(NODE_DATA(nid)->node_start_pfn)
 #define node_end_pfn(nid) pgdat_end_pfn(NODE_DATA(nid))
-static inline spinlock_t *zone_lru_lock(struct zone *zone)
-{
-	return &zone->zone_pgdat->lru_lock;
-}
-
 static inline struct lruvec *node_lruvec(struct pglist_data *pgdat)
 {
 	return &pgdat->lruvec;
+}
+
+static inline void lruvec_lock(struct lruvec *lruvec)
+{
+	spin_lock(&lruvec->lru_lock);
+}
+
+static inline void lruvec_unlock(struct lruvec *lruvec)
+{
+	spin_unlock(&lruvec->lru_lock);
+}
+
+static inline void lruvec_lock_irq(struct lruvec *lruvec)
+{
+	spin_lock_irq(&lruvec->lru_lock);
+}
+
+static inline void lruvec_unlock_irq(struct lruvec *lruvec)
+{
+	spin_unlock_irq(&lruvec->lru_lock);
+}
+
+static inline bool lruvec_trylock_irq(struct lruvec *lruvec)
+{
+	return spin_trylock_irq(&lruvec->lru_lock);
+}
+
+static inline bool lruvec_trylock_irqsave(struct lruvec *lruvec,
+					  unsigned long *flags)
+{
+	return spin_trylock_irqsave(&lruvec->lru_lock, *flags);
+}
+
+static inline void lruvec_lock_irqsave(struct lruvec *lruvec,
+				       unsigned long *flags)
+{
+	spin_lock_irqsave(&lruvec->lru_lock, *flags);
+}
+
+static inline void lruvec_unlock_irqrestore(struct lruvec *lruvec,
+					    unsigned long flags)
+{
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 }
 
 static inline unsigned long pgdat_end_pfn(pg_data_t *pgdat)

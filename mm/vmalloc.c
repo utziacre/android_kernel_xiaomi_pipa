@@ -333,6 +333,20 @@ EXPORT_SYMBOL(vmalloc_to_pfn);
 #define VM_VM_AREA	0x04
 
 static DEFINE_SPINLOCK(vmap_area_lock);
+
+/*
+ * Protects free_vmap_area_root and free_vmap_area_list.
+ *
+ * The free tree is only touched when address space is handed out or given
+ * back, while vmap_area_lock also covers every lookup of an allocated area,
+ * which happens on each vunmap() and on /proc/vmallocinfo.  Keeping the two
+ * apart lets allocation run without waiting for readers of the busy tree.
+ *
+ * Wherever both are needed the order is vmap_area_lock then
+ * free_vmap_area_lock.  alloc_vmap_area() takes them one after the other and
+ * never nests them.
+ */
+static DEFINE_SPINLOCK(free_vmap_area_lock);
 /* Export for kexec only */
 LIST_HEAD(vmap_area_list);
 static LLIST_HEAD(vmap_purge_list);
@@ -1117,21 +1131,24 @@ static struct vmap_area *alloc_vmap_area(unsigned long size,
 	kmemleak_scan_area(&va->rb_node, SIZE_MAX, gfp_mask & GFP_RECLAIM_MASK);
 
 retry:
-	spin_lock(&vmap_area_lock);
-
 	/*
-	 * If an allocation fails, the "vend" address is
-	 * returned. Therefore trigger the overflow path.
+	 * The search only reads and updates the free tree, so it does not need
+	 * vmap_area_lock: the address is invisible to everybody else until it
+	 * is inserted into the busy tree below.
 	 */
+	spin_lock(&free_vmap_area_lock);
 	addr = __alloc_vmap_area(size, align, vstart, vend, node);
+	spin_unlock(&free_vmap_area_lock);
+
 	if (unlikely(addr == vend))
 		goto overflow;
 
 	va->va_start = addr;
 	va->va_end = addr + size;
 	va->flags = 0;
-	insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
 
+	spin_lock(&vmap_area_lock);
+	insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
 	spin_unlock(&vmap_area_lock);
 
 	BUG_ON(!IS_ALIGNED(va->va_start, align));
@@ -1141,7 +1158,10 @@ retry:
 	return va;
 
 overflow:
-	spin_unlock(&vmap_area_lock);
+	/*
+	 * Both locks are already dropped: the search above only touched the
+	 * free tree, and nothing was published to the busy tree.
+	 */
 	if (!purged) {
 		purge_vmap_area_lazy();
 		purged = 1;
@@ -1177,7 +1197,10 @@ int unregister_vmap_purge_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(unregister_vmap_purge_notifier);
 
-static void __free_vmap_area(struct vmap_area *va)
+/*
+ * Callers must hold both vmap_area_lock and free_vmap_area_lock.
+ */
+static void __free_vmap_area_locked(struct vmap_area *va)
 {
 	BUG_ON(RB_EMPTY_NODE(&va->rb_node));
 
@@ -1199,7 +1222,11 @@ static void __free_vmap_area(struct vmap_area *va)
 static void free_vmap_area(struct vmap_area *va)
 {
 	spin_lock(&vmap_area_lock);
-	__free_vmap_area(va);
+	spin_lock(&free_vmap_area_lock);
+
+	__free_vmap_area_locked(va);
+
+	spin_unlock(&free_vmap_area_lock);
 	spin_unlock(&vmap_area_lock);
 }
 
@@ -1293,15 +1320,25 @@ static bool __purge_vmap_area_lazy(unsigned long start, unsigned long end)
 	resched_threshold = lazy_max_pages() << 1;
 
 	spin_lock(&vmap_area_lock);
+	spin_lock(&free_vmap_area_lock);
 	llist_for_each_entry_safe(va, n_va, valist, purge_list) {
 		unsigned long nr = (va->va_end - va->va_start) >> PAGE_SHIFT;
 
-		__free_vmap_area(va);
+		__free_vmap_area_locked(va);
 		atomic_long_sub(nr, &vmap_lazy_nr);
 
-		if (atomic_long_read(&vmap_lazy_nr) < resched_threshold)
+		if (atomic_long_read(&vmap_lazy_nr) < resched_threshold) {
+			/*
+			 * Drop the free lock around the reschedule; the order is
+			 * vmap_area_lock then free_vmap_area_lock and it has to
+			 * hold while the lock is taken again.
+			 */
+			spin_unlock(&free_vmap_area_lock);
 			cond_resched_lock(&vmap_area_lock);
+			spin_lock(&free_vmap_area_lock);
+		}
 	}
+	spin_unlock(&free_vmap_area_lock);
 	spin_unlock(&vmap_area_lock);
 	return true;
 }
@@ -3288,6 +3325,7 @@ struct vm_struct **pcpu_get_vm_areas(const unsigned long *offsets,
 	}
 retry:
 	spin_lock(&vmap_area_lock);
+	spin_lock(&free_vmap_area_lock);
 
 	/* start scanning - we scan from the top, begin with the last area */
 	area = term_area = last_area;
@@ -3373,6 +3411,7 @@ retry:
 		insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
 	}
 
+	spin_unlock(&free_vmap_area_lock);
 	spin_unlock(&vmap_area_lock);
 
 	/* insert all vm's */
@@ -3386,11 +3425,12 @@ retry:
 recovery:
 	/* Remove previously inserted areas. */
 	while (area--) {
-		__free_vmap_area(vas[area]);
+		__free_vmap_area_locked(vas[area]);
 		vas[area] = NULL;
 	}
 
 overflow:
+	spin_unlock(&free_vmap_area_lock);
 	spin_unlock(&vmap_area_lock);
 	if (!purged) {
 		purge_vmap_area_lazy();

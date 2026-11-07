@@ -3195,12 +3195,21 @@ out:
 	preempt_enable();
 
 	if (success && sched_predl) {
-		raw_spin_lock_irqsave(&cpu_rq(cpu)->lock, flags);
-		if (do_pl_notif(cpu_rq(cpu)))
-			cpufreq_update_util(cpu_rq(cpu),
+		int wcpu = task_cpu(p);
+
+		/*
+		 * Wakeups that return through the early exits above ('p ==
+		 * current' and the spinlock sleeper case) never run
+		 * select_task_rq() and so leave the local @cpu unset. Use the
+		 * task's CPU like the vendor hook does: it is the target CPU
+		 * on the regular path and the task's own CPU on the others.
+		 */
+		raw_spin_lock_irqsave(&cpu_rq(wcpu)->lock, flags);
+		if (do_pl_notif(cpu_rq(wcpu)))
+			cpufreq_update_util(cpu_rq(wcpu),
 						SCHED_CPUFREQ_WALT |
 						SCHED_CPUFREQ_PL);
-		raw_spin_unlock_irqrestore(&cpu_rq(cpu)->lock, flags);
+		raw_spin_unlock_irqrestore(&cpu_rq(wcpu)->lock, flags);
 	}
 	return success;
 }

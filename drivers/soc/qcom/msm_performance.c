@@ -9,23 +9,18 @@
 #include <linux/moduleparam.h>
 #include <linux/cpumask.h>
 #include <linux/cpufreq.h>
+#include <linux/kthread.h>
 #include <linux/slab.h>
-#include <linux/sched.h>
-#include <linux/tick.h>
-#include <trace/events/power.h>
 #include <linux/sysfs.h>
 #include <linux/module.h>
-#include <linux/input.h>
-#include <linux/kthread.h>
+#include <linux/wait.h>
 #include <linux/sched/core_ctl.h>
 
 /*
- * Sched will provide the data for every 20ms window,
- * will collect the data for 15 windows(300ms) and then update
- * sysfs nodes with aggregated data
+ * Sched provides the load data once per window; aggregate POLL_INT windows
+ * before publishing it to userspace.
  */
 #define POLL_INT 25
-#define NODE_NAME_MAX_CHARS 16
 
 enum cpu_clusters {
 	MIN = 0,
@@ -42,7 +37,8 @@ struct cpu_status {
 static DEFINE_PER_CPU(struct cpu_status, msm_perf_cpu_stats);
 
 struct events {
-	spinlock_t cpu_hotplug_lock;
+	wait_queue_head_t wait;
+	raw_spinlock_t cpu_hotplug_lock;
 	bool cpu_hotplug;
 	bool init_success;
 };
@@ -55,77 +51,132 @@ static unsigned int top_load[CLUSTER_MAX];
 static unsigned int curr_cap[CLUSTER_MAX];
 
 /*******************************sysfs start************************************/
-static int set_cpu_min_freq(const char *buf, const struct kernel_param *kp)
+/*
+ * Parse a "cpu:value" pair list into @req. Nothing outside @req is touched,
+ * so a malformed request can never leave the per-CPU limits half updated.
+ *
+ * Returns the number of pairs stored in @req, or a negative errno.
+ */
+static int msm_perf_parse_request(const char *buf, unsigned int (*req)[2],
+				  int max_pairs)
 {
-	int i, j, ntokens = 0;
-	unsigned int val, cpu;
-	const char *cp = buf;
-	struct cpu_status *i_cpu_stats;
-	struct cpufreq_policy policy;
-	cpumask_var_t limit_mask;
+	const char *p = buf;
+	int nr = 0;
 
-	while ((cp = strpbrk(cp + 1, " :")))
-		ntokens++;
+	while (*p) {
+		unsigned int cpu, val;
 
-	/* CPU:value pair */
-	if (!(ntokens % 2))
-		return -EINVAL;
-
-	cp = buf;
-	cpumask_clear(limit_mask);
-	for (i = 0; i < ntokens; i += 2) {
-		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
+		if (sscanf(p, "%u:%u", &cpu, &val) != 2)
 			return -EINVAL;
+
 		if (cpu >= nr_cpu_ids)
 			break;
 
-		if (cpu_possible(cpu)) {
-			i_cpu_stats = &per_cpu(msm_perf_cpu_stats, cpu);
-
-			i_cpu_stats->min = val;
-			cpumask_set_cpu(cpu, limit_mask);
+		if (cpu_possible(cpu) && nr < max_pairs) {
+			req[nr][0] = cpu;
+			req[nr][1] = val;
+			nr++;
 		}
 
-		cp = strnchr(cp, strlen(cp), ' ');
-		cp++;
+		p = strchr(p, ' ');
+		if (!p)
+			break;
+		p++;
 	}
 
+	return nr;
+}
+
+/*
+ * Store @val for @cpu and make every policy it belongs to re-evaluate its
+ * limits. The limits are only a per-CPU record; the value that actually
+ * reaches cpufreq is derived in msm_perf_adjust_notify().
+ */
+static int msm_perf_set_limits(const char *buf, bool is_min)
+{
+	unsigned int (*req)[2];
+	cpumask_t mask;
+	int nr, i, j;
+
+	req = kmalloc_array(nr_cpu_ids, sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	nr = msm_perf_parse_request(buf, req, nr_cpu_ids);
+	if (nr < 0) {
+		kfree(req);
+		return nr;
+	}
+
+	cpumask_clear(&mask);
+	for (i = 0; i < nr; i++) {
+		unsigned int cpu = req[i][0];
+		struct cpu_status *st = &per_cpu(msm_perf_cpu_stats, cpu);
+
+		if (is_min)
+			WRITE_ONCE(st->min, req[i][1]);
+		else
+			WRITE_ONCE(st->max, req[i][1]);
+
+		cpumask_set_cpu(cpu, &mask);
+	}
+	kfree(req);
+
 	/*
-	 * Since on synchronous systems policy is shared amongst multiple
-	 * CPUs only one CPU needs to be updated for the limit to be
-	 * reflected for the entire cluster. We can avoid updating the policy
-	 * of other CPUs in the cluster once it is done for at least one CPU
-	 * in the cluster
+	 * Since on synchronous systems the policy is shared amongst multiple
+	 * CPUs, only one CPU per policy needs to trigger the update. Offline
+	 * CPUs are skipped: their record is picked up by the ADJUST notifier
+	 * once they come back, and msm_perf_adjust_notify() clamps it then.
 	 */
 	get_online_cpus();
-	for_each_cpu(i, limit_mask) {
-		i_cpu_stats = &per_cpu(msm_perf_cpu_stats, i);
+	for_each_cpu(i, &mask) {
+		struct cpufreq_policy policy;
 
-		if (cpufreq_get_policy(&policy, i))
+		if (!cpu_online(i) || cpufreq_get_policy(&policy, i))
 			continue;
 
-		if (cpu_online(i) && (policy.min != i_cpu_stats->min))
-			cpufreq_update_policy(i);
+		cpufreq_update_policy(i);
 
 		for_each_cpu(j, policy.related_cpus)
-			cpumask_clear_cpu(j, limit_mask);
+			cpumask_clear_cpu(j, &mask);
 	}
 	put_online_cpus();
 
 	return 0;
 }
 
-static int get_cpu_min_freq(char *buf, const struct kernel_param *kp)
+static int msm_perf_get_limits(char *buf, bool is_min)
 {
 	int cnt = 0, cpu;
 
 	for_each_present_cpu(cpu) {
-		cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
-				"%d:%u ", cpu,
-				per_cpu(msm_perf_cpu_stats, cpu).min);
+		unsigned int val;
+
+		if (cnt >= PAGE_SIZE)
+			break;
+
+		if (is_min)
+			val = READ_ONCE(per_cpu(msm_perf_cpu_stats, cpu).min);
+		else
+			val = READ_ONCE(per_cpu(msm_perf_cpu_stats, cpu).max);
+
+		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%d:%u ", cpu, val);
 	}
-	cnt += snprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
+
+	if (cnt < PAGE_SIZE)
+		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
+
 	return cnt;
+}
+
+static int set_cpu_min_freq(const char *buf, const struct kernel_param *kp)
+{
+	return msm_perf_set_limits(buf, true);
+}
+
+static int get_cpu_min_freq(char *buf, const struct kernel_param *kp)
+{
+	return msm_perf_get_limits(buf, true);
 }
 
 static const struct kernel_param_ops param_ops_cpu_min_freq = {
@@ -136,66 +187,12 @@ module_param_cb(cpu_min_freq, &param_ops_cpu_min_freq, NULL, 0644);
 
 static int set_cpu_max_freq(const char *buf, const struct kernel_param *kp)
 {
-	int i, j, ntokens = 0;
-	unsigned int val, cpu;
-	const char *cp = buf;
-	struct cpu_status *i_cpu_stats;
-	struct cpufreq_policy policy;
-	cpumask_var_t limit_mask;
-
-	while ((cp = strpbrk(cp + 1, " :")))
-		ntokens++;
-
-	/* CPU:value pair */
-	if (!(ntokens % 2))
-		return -EINVAL;
-
-	cp = buf;
-	cpumask_clear(limit_mask);
-	for (i = 0; i < ntokens; i += 2) {
-		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
-			return -EINVAL;
-		if (cpu >= nr_cpu_ids)
-			break;
-
-		if (cpu_possible(cpu)) {
-			i_cpu_stats = &per_cpu(msm_perf_cpu_stats, cpu);
-
-			i_cpu_stats->max = val;
-			cpumask_set_cpu(cpu, limit_mask);
-		}
-		cp = strnchr(cp, strlen(cp), ' ');
-		cp++;
-	}
-
-	get_online_cpus();
-	for_each_cpu(i, limit_mask) {
-		i_cpu_stats = &per_cpu(msm_perf_cpu_stats, i);
-		if (cpufreq_get_policy(&policy, i))
-			continue;
-
-		if (cpu_online(i) && (policy.max != i_cpu_stats->max))
-			cpufreq_update_policy(i);
-
-		for_each_cpu(j, policy.related_cpus)
-			cpumask_clear_cpu(j, limit_mask);
-	}
-	put_online_cpus();
-
-	return 0;
+	return msm_perf_set_limits(buf, false);
 }
 
 static int get_cpu_max_freq(char *buf, const struct kernel_param *kp)
 {
-	int cnt = 0, cpu;
-
-	for_each_present_cpu(cpu) {
-		cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
-				"%d:%u ", cpu,
-				per_cpu(msm_perf_cpu_stats, cpu).max);
-	}
-	cnt += snprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
-	return cnt;
+	return msm_perf_get_limits(buf, false);
 }
 
 static const struct kernel_param_ops param_ops_cpu_max_freq = {
@@ -287,22 +284,44 @@ static int perf_adjust_notify(struct notifier_block *nb, unsigned long val,
 							void *data)
 {
 	struct cpufreq_policy *policy = data;
-	unsigned int cpu = policy->cpu;
-	struct cpu_status *cpu_st = &per_cpu(msm_perf_cpu_stats, cpu);
-	unsigned int min = cpu_st->min, max = cpu_st->max;
-
+	unsigned int min = 0, max = UINT_MAX;
+	int cpu;
 
 	if (val != CPUFREQ_ADJUST)
 		return NOTIFY_OK;
 
-	pr_debug("msm_perf: CPU%u policy before: %u:%u kHz\n", cpu,
-						policy->min, policy->max);
-	pr_debug("msm_perf: CPU%u seting min:max %u:%u kHz\n", cpu, min, max);
+	/*
+	 * Aggregate over the whole policy. Userspace is free to address a
+	 * single CPU, but the limit is shared by every CPU of the policy, so
+	 * reading only policy->cpu would drop the request for a sibling.
+	 */
+	for_each_cpu(cpu, policy->related_cpus) {
+		struct cpu_status *st = &per_cpu(msm_perf_cpu_stats, cpu);
+
+		min = max(min, READ_ONCE(st->min));
+		max = min(max, READ_ONCE(st->max));
+	}
+
+	/*
+	 * A floor above the current ceiling must not lift the ceiling.
+	 * cpufreq_verify_within_limits() raises policy->max to min when
+	 * policy->max < min, which would silently defeat a thermal cap or a
+	 * scaling_max_freq request and pin the cluster at its highest OPP.
+	 */
+	if (min > policy->cpuinfo.max_freq)
+		min = policy->cpuinfo.max_freq;
+	if (min > policy->max)
+		min = policy->max;
+	if (max < min)
+		max = min;
+
+	pr_debug("msm_perf: policy%u before: %u:%u, request %u:%u kHz\n",
+		 policy->cpu, policy->min, policy->max, min, max);
 
 	cpufreq_verify_within_limits(policy, min, max);
 
-	pr_debug("msm_perf: CPU%u policy after: %u:%u kHz\n", cpu,
-						policy->min, policy->max);
+	pr_debug("msm_perf: policy%u after: %u:%u kHz\n",
+		 policy->cpu, policy->min, policy->max);
 
 	return NOTIFY_OK;
 }
@@ -315,12 +334,19 @@ static int hotplug_notify(unsigned int cpu)
 {
 	unsigned long flags;
 
-	if (events_group.init_success) {
-		spin_lock_irqsave(&(events_group.cpu_hotplug_lock), flags);
-		events_group.cpu_hotplug = true;
-		spin_unlock_irqrestore(&(events_group.cpu_hotplug_lock), flags);
-		wake_up_process(events_notify_thread);
-	}
+	if (!events_group.init_success)
+		return 0;
+
+	/*
+	 * Runs from the CPU hotplug path, which must not sleep. A rt_mutex
+	 * based spinlock_t would do exactly that on PREEMPT_RT, so keep this
+	 * a raw lock: it only guards a single flag.
+	 */
+	raw_spin_lock_irqsave(&events_group.cpu_hotplug_lock, flags);
+	events_group.cpu_hotplug = true;
+	raw_spin_unlock_irqrestore(&events_group.cpu_hotplug_lock, flags);
+
+	wake_up_interruptible(&events_group.wait);
 
 	return 0;
 }
@@ -328,30 +354,22 @@ static int hotplug_notify(unsigned int cpu)
 static int events_notify_userspace(void *data)
 {
 	unsigned long flags;
-	bool notify_change;
 
-	while (1) {
+	while (!kthread_should_stop()) {
+		bool notify_change;
 
-		set_current_state(TASK_INTERRUPTIBLE);
-		spin_lock_irqsave(&(events_group.cpu_hotplug_lock), flags);
+		wait_event_interruptible(events_group.wait,
+					 READ_ONCE(events_group.cpu_hotplug) ||
+					 kthread_should_stop());
+		if (kthread_should_stop())
+			break;
 
-		if (!events_group.cpu_hotplug) {
-			spin_unlock_irqrestore(&(events_group.cpu_hotplug_lock),
-									flags);
-
-			schedule();
-			if (kthread_should_stop())
-				break;
-			spin_lock_irqsave(&(events_group.cpu_hotplug_lock),
-									flags);
-		}
-
-		set_current_state(TASK_RUNNING);
+		raw_spin_lock_irqsave(&events_group.cpu_hotplug_lock, flags);
 		notify_change = events_group.cpu_hotplug;
 		events_group.cpu_hotplug = false;
-		spin_unlock_irqrestore(&(events_group.cpu_hotplug_lock), flags);
+		raw_spin_unlock_irqrestore(&events_group.cpu_hotplug_lock, flags);
 
-		if (notify_change)
+		if (notify_change && events_kobj)
 			sysfs_notify(events_kobj, NULL, "cpu_hotplug");
 	}
 
@@ -360,8 +378,8 @@ static int events_notify_userspace(void *data)
 
 static int init_notify_group(void)
 {
-	int ret;
 	struct kobject *module_kobj;
+	int ret;
 
 	module_kobj = kset_find_obj(module_kset, KBUILD_MODNAME);
 	if (!module_kobj) {
@@ -370,6 +388,7 @@ static int init_notify_group(void)
 	}
 
 	notify_kobj = kobject_create_and_add("notify", module_kobj);
+	kobject_put(module_kobj);
 	if (!notify_kobj) {
 		pr_err("msm_perf: Failed to add notify_kobj\n");
 		return -ENOMEM;
@@ -377,17 +396,22 @@ static int init_notify_group(void)
 
 	ret = sysfs_create_group(notify_kobj, &notify_attr_group);
 	if (ret) {
+		pr_err("msm_perf: Failed to create notify sysfs\n");
 		kobject_put(notify_kobj);
-		pr_err("msm_perf: Failed to create sysfs\n");
+		notify_kobj = NULL;
 		return ret;
 	}
+
 	return 0;
 }
 
 static int init_events_group(void)
 {
-	int ret;
 	struct kobject *module_kobj;
+	int ret;
+
+	init_waitqueue_head(&events_group.wait);
+	raw_spin_lock_init(&events_group.cpu_hotplug_lock);
 
 	module_kobj = kset_find_obj(module_kset, KBUILD_MODNAME);
 	if (!module_kobj) {
@@ -396,6 +420,7 @@ static int init_events_group(void)
 	}
 
 	events_kobj = kobject_create_and_add("events", module_kobj);
+	kobject_put(module_kobj);
 	if (!events_kobj) {
 		pr_err("msm_perf: Failed to add events_kobj\n");
 		return -ENOMEM;
@@ -403,15 +428,19 @@ static int init_events_group(void)
 
 	ret = sysfs_create_group(events_kobj, &events_attr_group);
 	if (ret) {
-		pr_err("msm_perf: Failed to create sysfs\n");
+		pr_err("msm_perf: Failed to create events sysfs\n");
+		kobject_put(events_kobj);
+		events_kobj = NULL;
 		return ret;
 	}
 
-	spin_lock_init(&(events_group.cpu_hotplug_lock));
 	events_notify_thread = kthread_run(events_notify_userspace,
 					NULL, "msm_perf:events_notify");
-	if (IS_ERR(events_notify_thread))
-		return PTR_ERR(events_notify_thread);
+	if (IS_ERR(events_notify_thread)) {
+		ret = PTR_ERR(events_notify_thread);
+		events_notify_thread = NULL;
+		return ret;
+	}
 
 	events_group.init_success = true;
 
@@ -420,11 +449,17 @@ static int init_events_group(void)
 
 static void nr_notify_userspace(struct work_struct *work)
 {
+	if (!notify_kobj)
+		return;
+
 	sysfs_notify(notify_kobj, NULL, "aggr_top_load");
 	sysfs_notify(notify_kobj, NULL, "aggr_big_nr");
 	sysfs_notify(notify_kobj, NULL, "top_load_cluster");
 	sysfs_notify(notify_kobj, NULL, "curr_cap_cluster");
 }
+static DECLARE_WORK(sysfs_notify_work, nr_notify_userspace);
+
+static DEFINE_RAW_SPINLOCK(msm_perf_aggr_lock);
 
 static int msm_perf_core_ctl_notify(struct notifier_block *nb,
 					unsigned long unused,
@@ -432,9 +467,12 @@ static int msm_perf_core_ctl_notify(struct notifier_block *nb,
 {
 	static unsigned int tld, nrb, i;
 	static unsigned int top_ld[CLUSTER_MAX], curr_cp[CLUSTER_MAX];
-	static DECLARE_WORK(sysfs_notify_work, nr_notify_userspace);
 	struct core_ctl_notif_data *d = data;
-	int cluster = 0;
+	unsigned long flags;
+	bool notify = false;
+	int cluster;
+
+	raw_spin_lock_irqsave(&msm_perf_aggr_lock, flags);
 
 	nrb += d->nr_big;
 	tld += d->coloc_load_pct;
@@ -442,22 +480,28 @@ static int msm_perf_core_ctl_notify(struct notifier_block *nb,
 		top_ld[cluster] += d->ta_util_pct[cluster];
 		curr_cp[cluster] += d->cur_cap_pct[cluster];
 	}
-	i++;
-	if (i == POLL_INT) {
-		aggr_big_nr = ((nrb%POLL_INT) ? 1 : 0) + nrb/POLL_INT;
-		aggr_top_load = tld/POLL_INT;
+
+	if (++i == POLL_INT) {
+		aggr_big_nr = ((nrb % POLL_INT) ? 1 : 0) + nrb / POLL_INT;
+		aggr_top_load = tld / POLL_INT;
 		for (cluster = 0; cluster < CLUSTER_MAX; cluster++) {
-			top_load[cluster] = top_ld[cluster]/POLL_INT;
-			curr_cap[cluster] = curr_cp[cluster]/POLL_INT;
+			top_load[cluster] = top_ld[cluster] / POLL_INT;
+			curr_cap[cluster] = curr_cp[cluster] / POLL_INT;
 			top_ld[cluster] = 0;
 			curr_cp[cluster] = 0;
 		}
-		//reset Counters
+		/* reset counters */
 		tld = 0;
 		nrb = 0;
 		i = 0;
-		schedule_work(&sysfs_notify_work);
+		notify = true;
 	}
+
+	raw_spin_unlock_irqrestore(&msm_perf_aggr_lock, flags);
+
+	if (notify)
+		schedule_work(&sysfs_notify_work);
+
 	return NOTIFY_OK;
 }
 
@@ -498,18 +542,45 @@ static int __init msm_performance_init(void)
 	unsigned int cpu;
 	int rc;
 
-	cpufreq_register_notifier(&perf_cpufreq_nb, CPUFREQ_POLICY_NOTIFIER);
-
-	for_each_present_cpu(cpu)
+	/*
+	 * Seed the per-CPU records before the notifier can run. A zero max
+	 * would make cpufreq_verify_within_limits() clamp the policy to 0 as
+	 * soon as anything triggers CPUFREQ_ADJUST.
+	 */
+	for_each_present_cpu(cpu) {
+		per_cpu(msm_perf_cpu_stats, cpu).min = 0;
 		per_cpu(msm_perf_cpu_stats, cpu).max = UINT_MAX;
+	}
+
+	rc = cpufreq_register_notifier(&perf_cpufreq_nb,
+				       CPUFREQ_POLICY_NOTIFIER);
+	if (rc) {
+		pr_err("msm_perf: failed to register cpufreq notifier: %d\n",
+		       rc);
+		return rc;
+	}
 
 	rc = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE,
 		"msm_performance_cpu_hotplug",
 		hotplug_notify,
 		NULL);
+	if (rc) {
+		pr_err("msm_perf: failed to install hotplug callback: %d\n",
+		       rc);
+		cpufreq_unregister_notifier(&perf_cpufreq_nb,
+					    CPUFREQ_POLICY_NOTIFIER);
+		return rc;
+	}
 
-	init_events_group();
-	init_notify_group();
+	/*
+	 * Both groups only publish statistics to userspace; keep the cpufreq
+	 * limits working even if the sysfs side fails to come up.
+	 */
+	if (init_events_group())
+		pr_err("msm_perf: events group unavailable\n");
+
+	if (init_notify_group())
+		pr_err("msm_perf: notify group unavailable\n");
 
 	return 0;
 }

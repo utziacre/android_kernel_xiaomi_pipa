@@ -491,7 +491,47 @@ out:
 	return lruvec;
 }
 
-struct lruvec *mem_cgroup_page_lruvec(struct page *, struct pglist_data *);
+/*
+ * mem_cgroup_page_lruvec - return the lruvec an LRU page belongs to
+ * @page: the page
+ * @pgdat: pgdat the page lives on
+ *
+ * Hot path: called for every page that is added to, removed from or rotated
+ * on an LRU, so keep it inline.  Relies on page->mem_cgroup not changing
+ * while the page sits on an LRU, see mem_cgroup_move_account().
+ */
+static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page,
+						struct pglist_data *pgdat)
+{
+	struct mem_cgroup_per_node *mz;
+	struct mem_cgroup *memcg;
+	struct lruvec *lruvec;
+
+	if (mem_cgroup_disabled()) {
+		lruvec = &pgdat->lruvec;
+		goto out;
+	}
+
+	memcg = page_memcg(page);
+	/*
+	 * Swapcache readahead pages are added to the LRU - and
+	 * possibly migrated - before they are charged.
+	 */
+	if (!memcg)
+		memcg = root_mem_cgroup;
+
+	mz = memcg->nodeinfo[page_to_nid(page)];
+	lruvec = &mz->lruvec;
+out:
+	/*
+	 * Since a node can be onlined after the mem_cgroup was created,
+	 * we have to be prepared to initialize lruvec->pgdat here;
+	 * and if offlined then reonlined, we need to reinitialize it.
+	 */
+	if (unlikely(lruvec->pgdat != pgdat))
+		lruvec->pgdat = pgdat;
+	return lruvec;
+}
 
 bool task_in_mem_cgroup(struct task_struct *task, struct mem_cgroup *memcg);
 struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);

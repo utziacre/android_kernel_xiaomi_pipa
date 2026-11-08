@@ -5613,6 +5613,13 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			shrink_node_memcg(pgdat, memcg, sc, &lru_pages);
 			node_lru_pages += lru_pages;
 
+			/* Local limits and stalled reclaim need synchronous progress. */
+			if (sc->may_shrinkslab &&
+			    (!global_reclaim(sc) ||
+			     sc->priority <= DEF_PRIORITY - 2))
+				shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+					    sc->priority);
+
 			/* Record the group's reclaim efficiency */
 			vmpressure(sc->gfp_mask, memcg, false,
 				   sc->nr_scanned - scanned,
@@ -6518,6 +6525,7 @@ restart:
 		 */
 		sc.may_writepage = !laptop_mode && !nr_boost_reclaim;
 		sc.may_swap = !nr_boost_reclaim;
+		sc.may_shrinkslab = !nr_boost_reclaim;
 
 		/*
 		 * Do some background aging of the anon list, to give
@@ -6821,9 +6829,11 @@ kswapd_try_sleep:
 static int kshrinkd(void *pgdat)
 {
 	pg_data_t *p = pgdat;
+	struct reclaim_state reclaim_state = {};
 
 	/* This is technically a kswapd thread */
-	current->flags |= PF_KSWAPD;
+	current->flags |= PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD;
+	current->reclaim_state = &reclaim_state;
 	set_freezable();
 	while (1) {
 		unsigned int pri = DEF_PRIORITY;
@@ -6839,18 +6849,24 @@ static int kshrinkd(void *pgdat)
 		while (1) {
 			struct mem_cgroup *memcg = NULL;
 
+			if (kthread_freezable_should_stop(NULL))
+				goto out;
+
 			do {
 				shrink_slab(GFP_KERNEL, p->node_id, memcg, pri);
+				cond_resched();
 			} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 
 			if (!atomic_long_read(&kshrinkd_waiters))
 				break;
 
 			/* Iterate down each possible priority and then wrap */
-			pri = (pri - 1) % (DEF_PRIORITY + 1);
+			pri = pri ? pri - 1 : DEF_PRIORITY;
 		}
 	}
-	current->flags &= ~PF_KSWAPD;
+out:
+	current->reclaim_state = NULL;
+	current->flags &= ~(PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD);
 
 	return 0;
 }
@@ -6929,6 +6945,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 		.may_unmap = 1,
 		.may_swap = 1,
 		.hibernation_mode = 1,
+		.may_shrinkslab = 1,
 	};
 	struct zonelist *zonelist = node_zonelist(numa_node_id(), sc.gfp_mask);
 	struct task_struct *p = current;
@@ -7163,6 +7180,7 @@ static int __node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned in
 		.may_writepage = !!(node_reclaim_mode & RECLAIM_WRITE),
 		.may_unmap = !!(node_reclaim_mode & RECLAIM_UNMAP),
 		.may_swap = 1,
+		.may_shrinkslab = 1,
 		.reclaim_idx = gfp_zone(gfp_mask),
 	};
 

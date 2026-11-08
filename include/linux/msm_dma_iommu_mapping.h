@@ -13,6 +13,7 @@
 
 struct msm_iommu_data {
 	struct list_head map_list;
+	/* Protects cache membership and lookup, including invalidated entries. */
 	struct mutex lock;
 };
 
@@ -21,6 +22,8 @@ struct msm_iommu_data {
  * This function is not taking a reference to the dma_buf here. It is expected
  * that clients hold reference to the dma_buf until they are done with mapping
  * and unmapping.
+ * The SG list must describe the same buffer backing for a given entry count.
+ * Returns the number of DMA segments, or zero if mapping fails.
  */
 int msm_dma_map_sg_attrs(struct device *dev, struct scatterlist *sg, int nents,
 		   enum dma_data_direction dir, struct dma_buf *dma_buf,
@@ -30,6 +33,10 @@ void msm_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
 			    int nents, enum dma_data_direction dir,
 			    struct dma_buf *dma_buf, unsigned long attrs);
 
+/*
+ * Call after quiescing DMA users and before detaching the domain. New mappings
+ * and domain changes must be excluded by the caller until this call completes.
+ */
 void msm_dma_unmap_all_for_dev(struct device *dev);
 
 /*

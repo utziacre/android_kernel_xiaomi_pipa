@@ -315,7 +315,7 @@ static dma_addr_t fast_smmu_map_page(struct device *dev, struct page *page,
 	return iova + offset_from_phys_to_map;
 
 fail_free_iova:
-	__fast_smmu_free_iova(mapping, iova, size);
+	__fast_smmu_free_iova(mapping, iova, len);
 fail:
 	spin_unlock_irqrestore(&mapping->lock, flags);
 	return DMA_ERROR_CODE;

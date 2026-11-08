@@ -182,7 +182,7 @@ void av8l_fast_clear_stale_ptes(struct io_pgtable_ops *ops, u64 base,
 {
 	int i;
 	struct av8l_fast_io_pgtable *data = iof_pgtable_ops_to_data(ops);
-	av8l_fast_iopte *pmdp = iopte_pmd_offset(pmds, base, start);
+	av8l_fast_iopte *pmdp = iopte_pmd_offset(data->pmds, base, start);
 
 	for (i = start >> AV8L_FAST_PAGE_SHIFT;
 			i <= (end >> AV8L_FAST_PAGE_SHIFT); ++i) {
@@ -236,21 +236,30 @@ av8l_fast_prot_to_pte(struct av8l_fast_io_pgtable *data, int prot)
 	return pte;
 }
 
+static void av8l_fast_write_ptes(av8l_fast_iopte *ptep, phys_addr_t paddr,
+				 unsigned long nptes, av8l_fast_iopte prot)
+{
+	unsigned long i;
+
+	paddr &= AV8L_FAST_PTE_ADDR_MASK;
+	for (i = 0; i < nptes; i++, paddr += SZ_4K) {
+		__av8l_check_for_stale_tlb(ptep + i);
+		*(ptep + i) = prot | paddr;
+	}
+}
+
 static int av8l_fast_map(struct io_pgtable_ops *ops, unsigned long iova,
 			 phys_addr_t paddr, size_t size, int prot)
 {
 	struct av8l_fast_io_pgtable *data = iof_pgtable_ops_to_data(ops);
 	av8l_fast_iopte *ptep = iopte_pmd_offset(data->pmds, data->base, iova);
-	unsigned long i, nptes = size >> AV8L_FAST_PAGE_SHIFT;
-	av8l_fast_iopte pte;
+	unsigned long nptes = size >> AV8L_FAST_PAGE_SHIFT;
 
-	pte = av8l_fast_prot_to_pte(data, prot);
-	paddr &= AV8L_FAST_PTE_ADDR_MASK;
-	for (i = 0; i < nptes; i++, paddr += SZ_4K) {
-		__av8l_check_for_stale_tlb(ptep + i);
-		*(ptep + i) = pte | paddr;
-	}
+	av8l_fast_write_ptes(ptep, paddr, nptes,
+			     av8l_fast_prot_to_pte(data, prot));
 	av8l_clean_range(ops, ptep, ptep + nptes);
+	/* NO_DMA page tables also need ordering before hardware can use them. */
+	wmb();
 
 	return 0;
 }
@@ -300,13 +309,23 @@ static int av8l_fast_map_sg(struct io_pgtable_ops *ops,
 			unsigned long iova, struct scatterlist *sgl,
 			unsigned int nents, int prot, size_t *size)
 {
+	struct av8l_fast_io_pgtable *data = iof_pgtable_ops_to_data(ops);
+	av8l_fast_iopte *start = iopte_pmd_offset(data->pmds, data->base, iova);
+	av8l_fast_iopte *ptep = start;
+	av8l_fast_iopte pte = av8l_fast_prot_to_pte(data, prot);
 	struct scatterlist *sg;
 	int i;
 
 	for_each_sg(sgl, sg, nents, i) {
-		av8l_fast_map(ops, iova, sg_phys(sg), sg->length, prot);
-		iova += sg->length;
+		unsigned long nptes = sg->length >> AV8L_FAST_PAGE_SHIFT;
+
+		av8l_fast_write_ptes(ptep, sg_phys(sg), nptes, pte);
+		ptep += nptes;
 	}
+	/* All SG segments occupy one continuous run of PTEs. */
+	av8l_clean_range(ops, start, ptep);
+	/* Publish PTE stores even when coherent walks skip cache cleaning. */
+	wmb();
 
 	return nents;
 }

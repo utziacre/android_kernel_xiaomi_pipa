@@ -3633,7 +3633,7 @@ static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
 
 	ret = arm_smmu_domain_power_on(domain, smmu_domain->smmu);
 	if (ret)
-		return ret;
+		return 0;
 
 	arm_smmu_secure_domain_lock(smmu_domain);
 
@@ -3669,7 +3669,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 	LIST_HEAD(nonsecure_pool);
 
 	if (!ops)
-		return -ENODEV;
+		return 0;
 
 	if (arm_smmu_is_slave_side_secure(smmu_domain))
 		return msm_secure_smmu_map_sg(domain, iova, sg, nents, prot);
@@ -3693,6 +3693,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 		}
 
 		spin_lock_irqsave(&smmu_domain->cb_lock, flags);
+		size = 0;
 		ret = ops->map_sg(ops, iova, sg_start, idx_end - idx_start,
 				  prot, &size);
 		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
@@ -3709,6 +3710,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 			spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 			list_splice_init(&nonsecure_pool,
 					 &smmu_domain->nonsecure_pool);
+			size = 0;
 			ret = ops->map_sg(ops, iova, sg_start,
 					  idx_end - idx_start, prot, &size);
 			list_splice_init(&smmu_domain->nonsecure_pool,
@@ -3728,6 +3730,9 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 		idx_start = idx_end;
 		sg_start = sg_end;
 		size = 0;
+		/* Sleepable domains can yield between page-table batches. */
+		if (!(smmu_domain->attributes & (1 << DOMAIN_ATTR_ATOMIC)))
+			cond_resched();
 	}
 
 out:
@@ -3899,7 +3904,7 @@ static size_t msm_secure_smmu_unmap(struct iommu_domain *domain,
 
 	ret = arm_smmu_domain_power_on(domain, smmu_domain->smmu);
 	if (ret)
-		return ret;
+		return 0;
 
 	ret = ops->unmap(ops, iova, size);
 
@@ -3914,14 +3919,17 @@ static size_t msm_secure_smmu_map_sg(struct iommu_domain *domain,
 				     unsigned int nents, int prot)
 {
 	int ret;
-	size_t size;
+	size_t size = 0;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
 
 	ret = ops->map_sg(ops, iova, sg, nents, prot, &size);
 
-	if (!ret)
-		msm_secure_smmu_unmap(domain, iova, size);
+	if (ret <= 0) {
+		if (size)
+			msm_secure_smmu_unmap(domain, iova, size);
+		return 0;
+	}
 
 	return ret;
 }

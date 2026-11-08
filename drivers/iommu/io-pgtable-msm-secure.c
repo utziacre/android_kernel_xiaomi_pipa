@@ -65,7 +65,7 @@ int msm_iommu_sec_pgtbl_init(void)
 
 	/* Now allocate memory for the secure page tables */
 	attrs = DMA_ATTR_NO_KERNEL_MAPPING;
-	dev.coherent_dma_mask = DMA_BIT_MASK(sizeof(dma_addr_t) * 8);
+	dev.coherent_dma_mask = ~(dma_addr_t)0;
 	arch_setup_dma_ops(&dev, 0, 0, NULL, 0);
 	cpu_addr = dma_alloc_attrs(&dev, psize[0], &paddr, GFP_KERNEL, attrs);
 	if (!cpu_addr) {
@@ -181,6 +181,7 @@ static int msm_secure_map_sg(struct io_pgtable_ops *ops, unsigned long iova,
 	int i;
 	u32 resp;
 
+	*size = 0;
 	for_each_sg(sg, tmp, nents, i)
 		len += tmp->length;
 
@@ -284,7 +285,7 @@ static size_t msm_secure_unmap(struct io_pgtable_ops *ops, unsigned long iova,
 	struct scm_desc desc = {0};
 
 	if (!IS_ALIGNED(iova, SZ_1M) || !IS_ALIGNED(len, SZ_1M))
-		return ret;
+		return 0;
 
 	desc.args[0] = cfg->arm_msm_secure_cfg.sec_id;
 	desc.args[1] = cfg->arm_msm_secure_cfg.cbndx;
@@ -297,18 +298,15 @@ static size_t msm_secure_unmap(struct io_pgtable_ops *ops, unsigned long iova,
 	if (is_scm_armv8()) {
 		ret = scm_call2(SCM_SIP_FNID(SCM_SVC_MP,
 				IOMMU_SECURE_UNMAP2_FLAT), &desc);
-
-		if (!ret)
-			ret = len;
 	}
 	mutex_unlock(&data->pgtbl_lock);
-	return ret;
+	return ret ? 0 : len;
 }
 
 static phys_addr_t msm_secure_iova_to_phys(struct io_pgtable_ops *ops,
 					 unsigned long iova)
 {
-	return -EINVAL;
+	return 0;
 }
 
 static struct msm_secure_io_pgtable *

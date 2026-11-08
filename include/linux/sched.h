@@ -1949,6 +1949,9 @@ static inline int task_nice(const struct task_struct *p)
 
 extern int can_nice(const struct task_struct *p, const int nice);
 extern int task_curr(const struct task_struct *p);
+bool try_invoke_on_locked_down_task(struct task_struct *p,
+				    bool (*func)(struct task_struct *t, void *arg),
+				    void *arg);
 extern int idle_cpu(int cpu);
 extern int available_idle_cpu(int cpu);
 extern int sched_setscheduler(struct task_struct *, int, const struct sched_param *);

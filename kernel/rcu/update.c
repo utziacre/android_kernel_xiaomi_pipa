@@ -54,6 +54,8 @@
 #include <linux/sched/isolation.h>
 #include <linux/kprobes.h>
 #include <linux/rcuwait.h>
+#include <linux/rcupdate_trace.h>
+#include <linux/irq_work.h>
 
 #define CREATE_TRACE_POINTS
 

@@ -195,6 +195,12 @@ static inline void exit_tasks_rcu_start(void) { }
 static inline void exit_tasks_rcu_finish(void) { }
 #endif /* #else #ifdef CONFIG_TASKS_RCU */
 
+#ifdef CONFIG_TASKS_TRACE_RCU
+void exit_tasks_rcu_finish_trace(struct task_struct *t);
+#else
+static inline void exit_tasks_rcu_finish_trace(struct task_struct *t) { }
+#endif
+
 /**
  * cond_resched_tasks_rcu_qs - Report potential quiescent states to RCU
  *

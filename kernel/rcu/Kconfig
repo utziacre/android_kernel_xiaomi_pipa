@@ -243,6 +243,9 @@ config RCU_NOCB_CPU
 	  on the specified CPUs, but (1) the kthreads may be preempted
 	  between each callback, and (2) affinity or cgroups can be used
 	  to force the kthreads to run on whatever set of CPUs is desired.
+	  Separate per-group grace-period kthreads collect callbacks and
+	  wait for grace periods, so a CPU's callback batch cannot delay
+	  grace-period collection for the other CPUs in its group.
 
 	  Say Y here if you want to help to debug reduced OS jitter.
 	  Say N here if you are unsure.

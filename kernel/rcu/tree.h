@@ -154,7 +154,7 @@ struct rcu_node {
 				/* State of boost_kthread_task for tracing. */
 #ifdef CONFIG_RCU_NOCB_CPU
 	struct swait_queue_head nocb_gp_wq[2];
-				/* Place for rcu_nocb_kthread() to wait GP. */
+				/* Place for nocb GP kthreads to wait. */
 #endif /* #ifdef CONFIG_RCU_NOCB_CPU */
 	raw_spinlock_t fqslock ____cacheline_internodealigned_in_smp;
 
@@ -238,10 +238,11 @@ struct rcu_data {
 	atomic_long_t nocb_q_count_lazy; /*  invocation (all stages). */
 	struct rcu_head *nocb_follower_head; /* CBs ready to invoke. */
 	struct rcu_head **nocb_follower_tail;
-	struct swait_queue_head nocb_wq; /* For nocb kthreads to sleep on. */
+	struct swait_queue_head nocb_wq; /* Callback kthread waitqueue. */
 	struct task_struct *nocb_kthread;
+	struct task_struct *nocb_gp_kthread; /* Group's GP-wait kthread. */
 	raw_spinlock_t nocb_lock;	/* Guard following pair of fields. */
-	int nocb_defer_wakeup;		/* Defer wakeup of nocb_kthread. */
+	int nocb_defer_wakeup;		/* Defer wakeup of GP kthread. */
 	struct timer_list nocb_timer;	/* Enforce finite deferral. */
 
 	/* The following fields are used by the leader, hence own cacheline. */
@@ -249,6 +250,7 @@ struct rcu_data {
 					/* CBs waiting for GP. */
 	struct rcu_head **nocb_gp_tail;
 	bool nocb_leader_sleep;		/* Is the nocb leader thread asleep? */
+	struct swait_queue_head nocb_gp_wq; /* GP-wait kthread waitqueue. */
 	struct rcu_data *nocb_next_follower;
 					/* Next follower in wakeup chain. */
 

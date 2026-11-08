@@ -2455,22 +2455,6 @@ static void rcu_spawn_one_nocb_kthread(struct rcu_state *rsp, int cpu)
 	t = kthread_run_perf_critical(cpu_lp_mask, rcu_nocb_kthread, rdp_spawn,
 				      "rcuo%c/%d", rsp->abbr, cpu);
 	BUG_ON(IS_ERR(t));
-#ifdef CONFIG_RCU_NOCB_CPU_CB_BOOST
-	/*
-	 * Offloaded callbacks are invoked only by this kthread, so a
-	 * SCHED_OTHER load that keeps it from being scheduled stretches
-	 * every grace period waiting on this CPU without bound.  Run it at
-	 * the lowest RT priority; it is already confined to cpu_lp_mask, so
-	 * the big cores are unaffected.  The priority is set after the
-	 * kthread has been woken, which merely means that the first few
-	 * callbacks may still be invoked as SCHED_OTHER.
-	 */
-	{
-		struct sched_param sp = { .sched_priority = 1 };
-
-		WARN_ON_ONCE(sched_setscheduler_nocheck(t, SCHED_FIFO, &sp));
-	}
-#endif
 	WRITE_ONCE(rdp_spawn->nocb_kthread, t);
 }
 

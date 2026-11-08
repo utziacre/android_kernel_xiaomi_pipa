@@ -4664,10 +4664,6 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 	if (sc->nr_reclaimed - reclaimed >= MIN_LRU_BATCH && !need_aging)
 		sc->memcgs_need_aging = false;
 done:
-	if (scanned && global_reclaim(sc))
-		vmpressure(sc->gfp_mask, NULL, true, scanned,
-			   sc->nr_reclaimed - reclaimed, sc->order);
-
 	clear_mm_walk();
 
 	blk_finish_plug(&plug);
@@ -5356,6 +5352,8 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	bool proportional_reclaim;
 
 	if (lru_gen_enabled()) {
+		/* MGLRU does not use the legacy scan-target size. */
+		*lru_pages = 0;
 		lru_gen_shrink_lruvec(lruvec, sc);
 		return;
 	}
@@ -5616,10 +5614,9 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			node_lru_pages += lru_pages;
 
 			/* Record the group's reclaim efficiency */
-			if (!lru_gen_enabled())
-				vmpressure(sc->gfp_mask, memcg, false,
-					   sc->nr_scanned - scanned,
-					   sc->nr_reclaimed - reclaimed, sc->order);
+			vmpressure(sc->gfp_mask, memcg, false,
+				   sc->nr_scanned - scanned,
+				   sc->nr_reclaimed - reclaimed, sc->order);
 
 			/*
 			 * Direct reclaim and kswapd have to scan all memory
@@ -5646,10 +5643,9 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		 * making the cost model (i.e. scan:free) different from that
 		 * of LRU.
 		 */
-		if (!lru_gen_enabled())
-			vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
-				   sc->nr_scanned - nr_scanned,
-				   sc->nr_reclaimed - nr_reclaimed, sc->order);
+		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+			   sc->nr_scanned - nr_scanned,
+			   sc->nr_reclaimed - nr_reclaimed, sc->order);
 
 		if (reclaim_state) {
 			sc->nr_reclaimed += reclaim_state->reclaimed_slab;

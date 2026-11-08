@@ -459,17 +459,18 @@ void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 		return;
 
 	/*
-	 * It's possible for kswapd to keep doing reclaim even though memory
-	 * pressure isn't high anymore. We should only track vmpressure when
-	 * there are failed memory allocations actively stuck in the page
-	 * allocator's slow path. No failed allocations means pressure is fine.
+	 * Gate global LMK pressure on stalled page allocations. Memcg reclaim
+	 * can be caused by a local limit while the rest of the system has free
+	 * memory, so its notifications must not depend on global waiters.
 	 */
-	read_lock_irqsave(&vmpr->users_lock, flags);
-	if (!atomic_long_read(&vmpr->users)) {
+	if (!memcg && tree) {
+		read_lock_irqsave(&vmpr->users_lock, flags);
+		if (!atomic_long_read(&vmpr->users)) {
+			read_unlock_irqrestore(&vmpr->users_lock, flags);
+			return;
+		}
 		read_unlock_irqrestore(&vmpr->users_lock, flags);
-		return;
 	}
-	read_unlock_irqrestore(&vmpr->users_lock, flags);
 
 	__vmpressure(gfp, memcg, false, tree, scanned, reclaimed);
 }

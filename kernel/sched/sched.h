@@ -655,6 +655,7 @@ struct cfs_rq {
 	int			throttled;
 	int			throttle_count;
 	struct list_head	throttled_list;
+	struct list_head	throttled_csd_list;
 #endif /* CONFIG_CFS_BANDWIDTH */
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 };
@@ -1139,6 +1140,12 @@ struct rq {
 #if defined(CONFIG_PREEMPT_RT_BASE) && defined(CONFIG_SMP)
 	int			nr_pinned;
 #endif
+
+#if defined(CONFIG_CFS_BANDWIDTH) && defined(CONFIG_SMP)
+	call_single_data_t	cfsb_csd;
+	struct list_head	cfsb_csd_list;
+	bool			cfsb_csd_pending;
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -1261,6 +1268,20 @@ static inline void rq_clock_cancel_skipupdate(struct rq *rq)
 {
 	lockdep_assert_held(&rq->lock);
 	rq->clock_update_flags &= ~RQCF_REQ_SKIP;
+}
+
+/* Update the rq clock once before a loop of unthrottle operations. */
+static inline void rq_clock_start_loop_update(struct rq *rq)
+{
+	lockdep_assert_held(&rq->lock);
+	SCHED_WARN_ON(rq->clock_update_flags & RQCF_ACT_SKIP);
+	rq->clock_update_flags |= RQCF_ACT_SKIP;
+}
+
+static inline void rq_clock_stop_loop_update(struct rq *rq)
+{
+	lockdep_assert_held(&rq->lock);
+	rq->clock_update_flags &= ~RQCF_ACT_SKIP;
 }
 
 struct rq_flags {

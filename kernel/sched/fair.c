@@ -5557,10 +5557,79 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 		resched_curr(rq);
 }
 
-static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+#ifdef CONFIG_SMP
+static void __cfsb_csd_unthrottle(struct rq *rq)
 {
-	struct cfs_rq *cfs_rq;
+	struct cfs_rq *cfs_rq, *tmp;
+
+	lockdep_assert_held(&rq->lock);
+	update_rq_clock(rq);
+	rq_clock_start_loop_update(rq);
+
+	/* Pair with sched_free_group_rcu() while advancing through the list. */
+	rcu_read_lock();
+	list_for_each_entry_safe(cfs_rq, tmp, &rq->cfsb_csd_list,
+				 throttled_csd_list) {
+		if (cfs_rq_throttled(cfs_rq))
+			unthrottle_cfs_rq(cfs_rq);
+
+		/* Keep destruction's lockless scan aware of in-flight work. */
+		list_del_init(&cfs_rq->throttled_csd_list);
+	}
+	rcu_read_unlock();
+
+	rq_clock_stop_loop_update(rq);
+}
+
+static void cfsb_csd_unthrottle(void *arg)
+{
+	struct rq *rq = arg;
+	struct rq_flags rf;
+
+	rq_lock(rq, &rf);
+	/* The SMP handler unlocks this CSD before invoking the callback. */
+	rq->cfsb_csd_pending = false;
+	__cfsb_csd_unthrottle(rq);
+	rq_unlock(rq, &rf);
+}
+
+static void unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
+{
+	struct rq *rq = rq_of(cfs_rq);
+
+	lockdep_assert_held(&rq->lock);
+	if (SCHED_WARN_ON(!cfs_rq_throttled(cfs_rq) ||
+			  cfs_rq->runtime_remaining <= 0 ||
+			  !list_empty(&cfs_rq->throttled_csd_list)))
+		return;
+
+	list_add_tail(&cfs_rq->throttled_csd_list, &rq->cfsb_csd_list);
+	/*
+	 * Destruction may drain the list before the IPI runs. Keep the pending
+	 * state until the callback runs: 4.19's async API waits on a busy CSD.
+	 */
+	if (!rq->cfsb_csd_pending) {
+		rq->cfsb_csd_pending = true;
+		if (smp_call_function_single_async(cpu_of(rq), &rq->cfsb_csd)) {
+			rq->cfsb_csd_pending = false;
+			__cfsb_csd_unthrottle(rq);
+		}
+	}
+}
+#else
+static void unthrottle_cfs_rq_async(struct cfs_rq *cfs_rq)
+{
+	unthrottle_cfs_rq(cfs_rq);
+}
+#endif
+
+static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+{
+	struct cfs_rq *cfs_rq, *tmp;
 	u64 runtime, remaining = 1;
+	bool throttled = false;
+	int this_cpu = smp_processor_id();
+	LIST_HEAD(local_unthrottle);
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
@@ -5568,11 +5637,20 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
 		struct rq *rq = rq_of(cfs_rq);
 		struct rq_flags rf;
 
+		if (!remaining) {
+			throttled = true;
+			break;
+		}
+
 		rq_lock_irqsave(rq, &rf);
 		if (!cfs_rq_throttled(cfs_rq))
 			goto next;
 
-		/* By the above check, this should never be true */
+		/* Another distributor has already funded this queue. */
+		if (!list_empty(&cfs_rq->throttled_csd_list))
+			goto next;
+
+		/* By the above checks, this should never be true */
 		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
 
 		raw_spin_lock(&cfs_b->lock);
@@ -5586,16 +5664,35 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
 		cfs_rq->runtime_remaining += runtime;
 
 		/* we check whether we're throttled above */
-		if (cfs_rq->runtime_remaining > 0)
-			unthrottle_cfs_rq(cfs_rq);
+		if (cfs_rq->runtime_remaining > 0) {
+			if (cpu_of(rq) != this_cpu)
+				unthrottle_cfs_rq_async(cfs_rq);
+			else
+				list_add_tail(&cfs_rq->throttled_csd_list,
+					      &local_unthrottle);
+		} else {
+			throttled = true;
+		}
 
 next:
 		rq_unlock_irqrestore(rq, &rf);
+	}
 
-		if (!remaining)
-			break;
+	/* Finish local work before leaving the RCU section protecting cfs_rq. */
+	list_for_each_entry_safe(cfs_rq, tmp, &local_unthrottle,
+				 throttled_csd_list) {
+		struct rq *rq = rq_of(cfs_rq);
+		struct rq_flags rf;
+
+		rq_lock_irqsave(rq, &rf);
+		if (cfs_rq_throttled(cfs_rq))
+			unthrottle_cfs_rq(cfs_rq);
+		list_del_init(&cfs_rq->throttled_csd_list);
+		rq_unlock_irqrestore(rq, &rf);
 	}
 	rcu_read_unlock();
+
+	return throttled;
 }
 
 /*
@@ -5639,10 +5736,8 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 	while (throttled && cfs_b->runtime > 0) {
 		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
 		/* we can't nest cfs_b->lock while distributing bandwidth */
-		distribute_cfs_runtime(cfs_b);
+		throttled = distribute_cfs_runtime(cfs_b);
 		raw_spin_lock_irqsave(&cfs_b->lock, flags);
-
-		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
 	}
 
 	/*
@@ -5909,6 +6004,7 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->runtime_enabled = 0;
 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
+	INIT_LIST_HEAD(&cfs_rq->throttled_csd_list);
 	walt_init_cfs_rq_stats(cfs_rq);
 }
 
@@ -5926,12 +6022,31 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 
 static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 {
+#ifdef CONFIG_SMP
+	int cpu;
+#endif
+
 	/* init_cfs_bandwidth() was not called */
 	if (!cfs_b->throttled_cfs_rq.next)
 		return;
 
 	hrtimer_cancel(&cfs_b->period_timer);
 	hrtimer_cancel(&cfs_b->slack_timer);
+
+	/* No more work for this group can be queued after both timers stop. */
+#ifdef CONFIG_SMP
+	for_each_possible_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+		struct rq_flags rf;
+
+		if (list_empty(&rq->cfsb_csd_list))
+			continue;
+
+		rq_lock_irqsave(rq, &rf);
+		__cfsb_csd_unthrottle(rq);
+		rq_unlock_irqrestore(rq, &rf);
+	}
+#endif
 }
 
 /*
@@ -5967,6 +6082,10 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
 
 	lockdep_assert_held(&rq->lock);
 
+	/* This tree's set_rq_offline() does not update the clock itself. */
+	update_rq_clock(rq);
+	rq_clock_start_loop_update(rq);
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(tg, &task_groups, list) {
 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
@@ -5989,6 +6108,7 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
 			unthrottle_cfs_rq(cfs_rq);
 	}
 	rcu_read_unlock();
+	rq_clock_stop_loop_update(rq);
 }
 
 #else /* CONFIG_CFS_BANDWIDTH */
@@ -13447,6 +13567,18 @@ void show_numa_stats(struct task_struct *p, struct seq_file *m)
 __init void init_sched_fair_class(void)
 {
 #ifdef CONFIG_SMP
+#ifdef CONFIG_CFS_BANDWIDTH
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+
+		rq->cfsb_csd.func = cfsb_csd_unthrottle;
+		rq->cfsb_csd.info = rq;
+		INIT_LIST_HEAD(&rq->cfsb_csd_list);
+	}
+#endif
+
 	open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
 
 #ifdef CONFIG_NO_HZ_COMMON

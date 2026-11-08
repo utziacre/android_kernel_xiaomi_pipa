@@ -997,9 +997,11 @@ static bool rtmutex_spin_on_owner(struct rt_mutex *lock,
 		 *  - current is not longer the top waiter
 		 *  - current is requested to reschedule (redundant
 		 *    for CONFIG_PREEMPT_RCU=y)
+		 *  - current was woken by a timeout, signal or lock event
 		 *  - the VCPU on which owner runs is preempted
 		 */
 		if (!on_cpu || need_resched() ||
+		    READ_ONCE(current->state) == TASK_RUNNING ||
 		    !rt_mutex_waiter_is_top_waiter(lock, waiter)) {
 			res = false;
 			break;

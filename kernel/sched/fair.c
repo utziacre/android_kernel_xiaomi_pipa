@@ -158,15 +158,7 @@ unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 unsigned int sysctl_sched_place_lag = 1;
 unsigned int sysctl_sched_wakeup_preempt_gran = 1024;
 
-/*
- * A task that ran less than this long ago stays where it is: task_hot()
- * refuses to migrate it and the idle-balance paths that gate on
- * rq->avg_idle need this much idle time before they look for work.
- *
- * 30ms instead of 0.5ms, so a task keeps its warm cache across the whole
- * interactive window instead of being shuffled on the next balance tick.
- */
-const_debug unsigned int sysctl_sched_migration_cost	= 30000000UL;
+const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
 #ifdef CONFIG_SMP

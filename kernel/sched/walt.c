@@ -2647,24 +2647,17 @@ DEFINE_RAW_SPINLOCK(related_thread_group_lock);
 /*
  * Task groups whose aggregate demand on a cpu is more than
  * sched_group_upmigrate need to be up-migrated if possible.
- *
- * 120% of the cluster's capacity: a group has to be well past what the
- * cluster can deliver before it is worth a migration.
  */
 unsigned int __read_mostly sched_group_upmigrate = 20000000;
-unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 120;
+unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 100;
 
 /*
  * Task groups, once up-migrated, will need to drop their aggregate
  * demand to less than sched_group_downmigrate before they are "down"
  * migrated.
- *
- * 100%, so the two thresholds leave a 20% hysteresis band instead of the
- * default 5%: groups sitting right at the cluster limit stop bouncing
- * between clusters on every window.
  */
 unsigned int __read_mostly sched_group_downmigrate = 19000000;
-unsigned int __read_mostly sysctl_sched_group_downmigrate_pct = 100;
+unsigned int __read_mostly sysctl_sched_group_downmigrate_pct = 95;
 
 static inline
 void update_best_cluster(struct related_thread_group *grp,

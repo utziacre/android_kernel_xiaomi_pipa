@@ -48,8 +48,9 @@ static int smmu_aspace_map_vma(struct msm_gem_address_space *aspace,
 
 	ret = aspace->mmu->funcs->map_dma_buf(aspace->mmu, sgt,
 			DMA_BIDIRECTIONAL, flags);
-	if (!ret)
-		vma->iova = sg_dma_address(sgt->sgl);
+	if (ret)
+		return ret;
+	vma->iova = sg_dma_address(sgt->sgl);
 
 	/* Get a reference to the aspace to keep it around */
 	kref_get(&aspace->kref);
@@ -69,25 +70,20 @@ static void smmu_aspace_add_to_active(
 {
 	WARN_ON(!mutex_is_locked(&aspace->list_lock));
 	list_move_tail(&msm_obj->iova_list, &aspace->active_list);
-	msm_obj->in_active_list = true;
+	msm_obj->active_aspace = aspace;
 }
 
 static void smmu_aspace_remove_from_active(
 		struct msm_gem_address_space *aspace,
 		struct msm_gem_object *obj)
 {
-	struct msm_gem_object *msm_obj, *next;
-
 	WARN_ON(!mutex_is_locked(&aspace->list_lock));
 
-	list_for_each_entry_safe(msm_obj, next, &aspace->active_list,
-			iova_list) {
-		if (msm_obj == obj) {
-			msm_obj->in_active_list = false;
-			list_del(&msm_obj->iova_list);
-			break;
-		}
-	}
+	if (obj->active_aspace != aspace)
+		return;
+
+	list_del_init(&obj->iova_list);
+	obj->active_aspace = NULL;
 }
 
 static int smmu_aspace_register_cb(

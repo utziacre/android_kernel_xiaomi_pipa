@@ -426,6 +426,7 @@ int msm_gem_get_iova(struct drm_gem_object *obj,
 		struct page **pages;
 		struct device *dev;
 		struct dma_buf *dmabuf;
+		struct dma_buf_attachment *attach;
 		bool reattach = false;
 
 		dev = msm_gem_get_aspace_device(aspace);
@@ -434,20 +435,28 @@ int msm_gem_get_iova(struct drm_gem_object *obj,
 				msm_obj->obj_dirty)) {
 			dmabuf = obj->import_attach->dmabuf;
 
-			DRM_DEBUG("detach nsec-dev:%pK attach sec-dev:%pK\n",
+			DRM_DEBUG("remap buffer from dev:%pK to dev:%pK\n",
 					obj->import_attach->dev, dev);
 			SDE_EVT32(obj->import_attach->dev, dev, msm_obj->sgt);
 
+			/* A dirty mapping on the same device needs no new attachment. */
+			attach = obj->import_attach;
+			if (dev != attach->dev) {
+				/* Keep the old attachment usable if allocation fails. */
+				attach = dma_buf_attach(dmabuf, dev);
+				if (IS_ERR(attach)) {
+					ret = PTR_ERR(attach);
+					DRM_ERROR("dma_buf_attach failure, err=%d\n", ret);
+					goto unlock;
+				}
+			}
 			if (msm_obj->sgt)
 				dma_buf_unmap_attachment(obj->import_attach,
 					msm_obj->sgt, DMA_BIDIRECTIONAL);
-			dma_buf_detach(dmabuf, obj->import_attach);
-
-			obj->import_attach = dma_buf_attach(dmabuf, dev);
-			if (IS_ERR(obj->import_attach)) {
-				DRM_ERROR("dma_buf_attach failure, err=%ld\n",
-						PTR_ERR(obj->import_attach));
-				goto unlock;
+			msm_obj->sgt = NULL;
+			if (attach != obj->import_attach) {
+				dma_buf_detach(dmabuf, obj->import_attach);
+				obj->import_attach = attach;
 			}
 			msm_obj->obj_dirty = false;
 			reattach = true;
@@ -485,7 +494,7 @@ int msm_gem_get_iova(struct drm_gem_object *obj,
 
 	*iova = vma->iova;
 
-	if (aspace &&  !msm_obj->in_active_list) {
+	if (aspace && !msm_obj->active_aspace) {
 		mutex_lock(&aspace->list_lock);
 		msm_gem_add_obj_to_aspace_active_list(aspace, obj);
 		mutex_unlock(&aspace->list_lock);
@@ -509,13 +518,16 @@ uint64_t msm_gem_iova(struct drm_gem_object *obj,
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
 	struct msm_gem_vma *vma;
+	uint64_t iova;
 
 	mutex_lock(&msm_obj->lock);
 	vma = lookup_vma(obj, aspace);
+	/* The VMA can be removed as soon as the object lock is dropped. */
+	iova = vma ? vma->iova : 0;
 	mutex_unlock(&msm_obj->lock);
 	WARN_ON(!vma);
 
-	return vma ? vma->iova : 0;
+	return iova;
 }
 
 void msm_gem_put_iova(struct drm_gem_object *obj,
@@ -725,6 +737,7 @@ void msm_gem_purge(struct drm_gem_object *obj, enum msm_gem_lock subclass)
 {
 	struct drm_device *dev = obj->dev;
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct msm_gem_address_space *aspace;
 
 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
 	WARN_ON(!is_purgeable(msm_obj));
@@ -732,13 +745,13 @@ void msm_gem_purge(struct drm_gem_object *obj, enum msm_gem_lock subclass)
 
 	mutex_lock_nested(&msm_obj->lock, subclass);
 
-	put_iova(obj);
-	if (msm_obj->aspace) {
-		mutex_lock(&msm_obj->aspace->list_lock);
-		msm_gem_remove_obj_from_aspace_active_list(msm_obj->aspace,
-				obj);
-		mutex_unlock(&msm_obj->aspace->list_lock);
+	aspace = msm_obj->active_aspace;
+	if (aspace) {
+		mutex_lock(&aspace->list_lock);
+		msm_gem_remove_obj_from_aspace_active_list(aspace, obj);
+		mutex_unlock(&aspace->list_lock);
 	}
+	put_iova(obj);
 
 	msm_gem_vunmap_locked(obj);
 
@@ -906,6 +919,7 @@ void msm_gem_free_object(struct drm_gem_object *obj)
 {
 	struct drm_device *dev = obj->dev;
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct msm_gem_address_space *aspace;
 
 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
 
@@ -916,13 +930,13 @@ void msm_gem_free_object(struct drm_gem_object *obj)
 
 	mutex_lock(&msm_obj->lock);
 
-	put_iova(obj);
-	if (msm_obj->aspace) {
-		mutex_lock(&msm_obj->aspace->list_lock);
-		msm_gem_remove_obj_from_aspace_active_list(msm_obj->aspace,
-				obj);
-		mutex_unlock(&msm_obj->aspace->list_lock);
+	aspace = msm_obj->active_aspace;
+	if (aspace) {
+		mutex_lock(&aspace->list_lock);
+		msm_gem_remove_obj_from_aspace_active_list(aspace, obj);
+		mutex_unlock(&aspace->list_lock);
 	}
+	put_iova(obj);
 
 	if (obj->import_attach) {
 		if (msm_obj->vaddr)
@@ -1009,7 +1023,7 @@ static int msm_gem_new_impl(struct drm_device *dev,
 	INIT_LIST_HEAD(&msm_obj->vmas);
 	INIT_LIST_HEAD(&msm_obj->iova_list);
 	msm_obj->aspace = NULL;
-	msm_obj->in_active_list = false;
+	msm_obj->active_aspace = NULL;
 	msm_obj->obj_dirty = false;
 
 	if (struct_mutex_locked) {

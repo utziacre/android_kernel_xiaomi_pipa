@@ -240,6 +240,19 @@ static void msm_framebuffer_kunmap(struct drm_framebuffer *fb)
 	}
 }
 
+/* Multi-plane formats can use different offsets into the same GEM object. */
+static bool msm_framebuffer_plane_is_duplicate(struct drm_framebuffer *fb,
+		int plane)
+{
+	int i;
+
+	for (i = 0; i < plane; i++)
+		if (fb->obj[i] == fb->obj[plane])
+			return true;
+
+	return false;
+}
+
 /* prepare/pin all the fb's bo's for scanout.  Note that it is not valid
  * to prepare an fb more multiple different initiator 'id's.  But that
  * should be fine, since only the scanout (mdpN) side of things needs
@@ -260,16 +273,24 @@ int msm_framebuffer_prepare(struct drm_framebuffer *fb,
 	msm_fb = to_msm_framebuffer(fb);
 	n = fb->format->num_planes;
 	for (i = 0; i < n; i++) {
+		if (msm_framebuffer_plane_is_duplicate(fb, i))
+			continue;
 		ret = msm_gem_get_iova(fb->obj[i], aspace, &iova);
-		DBG("FB[%u]: iova[%d]: %08llx (%d)", fb->base.id, i, iova, ret);
 		if (ret)
-			return ret;
+			goto fail;
+		DBG("FB[%u]: iova[%d]: %08llx", fb->base.id, i, iova);
 	}
 
 	if (msm_fb->flags & MSM_FRAMEBUFFER_FLAG_KMAP)
 		msm_framebuffer_kmap(fb);
 
 	return 0;
+
+fail:
+	while (i--)
+		if (!msm_framebuffer_plane_is_duplicate(fb, i))
+			msm_gem_put_iova(fb->obj[i], aspace);
+	return ret;
 }
 
 void msm_framebuffer_cleanup(struct drm_framebuffer *fb,
@@ -290,7 +311,8 @@ void msm_framebuffer_cleanup(struct drm_framebuffer *fb,
 		msm_framebuffer_kunmap(fb);
 
 	for (i = 0; i < n; i++)
-		msm_gem_put_iova(fb->obj[i], aspace);
+		if (!msm_framebuffer_plane_is_duplicate(fb, i))
+			msm_gem_put_iova(fb->obj[i], aspace);
 }
 
 uint32_t msm_framebuffer_iova(struct drm_framebuffer *fb,

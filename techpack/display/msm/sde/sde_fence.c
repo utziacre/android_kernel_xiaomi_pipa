@@ -30,7 +30,7 @@ signed long sde_sync_wait(void *fnc, long timeout_ms)
 {
 	struct dma_fence *fence = fnc;
 	int rc;
-	char timeline_str[TIMELINE_VAL_LENGTH];
+	char timeline_str[TIMELINE_VAL_LENGTH] = "unknown";
 
 	if (!fence)
 		return -EINVAL;
@@ -133,7 +133,7 @@ static bool sde_fence_signaled(struct dma_fence *fence)
 	struct sde_fence *f = to_sde_fence(fence);
 	bool status;
 
-	status = (int)((fence->seqno - f->ctx->done_count) <= 0);
+	status = (s32)(fence->seqno - READ_ONCE(f->ctx->done_count)) <= 0;
 	SDE_DEBUG("status:%d fence seq:%d and timeline:%d\n",
 			status, fence->seqno, f->ctx->done_count);
 	return status;
@@ -291,35 +291,20 @@ void sde_fence_prepare(struct sde_fence_context *ctx)
 	}
 }
 
-static void _sde_fence_trigger(struct sde_fence_context *ctx, bool error)
+static void _sde_fence_trigger(struct sde_fence_context *ctx,
+		struct list_head *ready)
 {
 	unsigned long flags;
 	struct sde_fence *fc, *next;
-	bool is_signaled = false;
 
-	kref_get(&ctx->kref);
-
-	spin_lock(&ctx->list_lock);
-	if (list_empty(&ctx->fence_list_head)) {
-		SDE_DEBUG("nothing to trigger!\n");
-		goto end;
-	}
-
-	list_for_each_entry_safe(fc, next, &ctx->fence_list_head, fence_list) {
+	/* Keep callbacks and final fence releases outside the timeline list lock. */
+	list_for_each_entry_safe(fc, next, ready, fence_list) {
+		list_del_init(&fc->fence_list);
 		spin_lock_irqsave(&ctx->lock, flags);
-		if (error)
-			dma_fence_set_error(&fc->base, -EBUSY);
-		is_signaled = dma_fence_is_signaled_locked(&fc->base);
+		dma_fence_signal_locked(&fc->base);
 		spin_unlock_irqrestore(&ctx->lock, flags);
-
-		if (is_signaled) {
-			list_del_init(&fc->fence_list);
-			dma_fence_put(&fc->base);
-		}
+		dma_fence_put(&fc->base);
 	}
-end:
-	spin_unlock(&ctx->list_lock);
-	kref_put(&ctx->kref, sde_fence_destroy);
 }
 
 int sde_fence_create(struct sde_fence_context *ctx, uint64_t *val,
@@ -362,44 +347,69 @@ void sde_fence_signal(struct sde_fence_context *ctx, ktime_t ts,
 		enum sde_fence_event fence_event)
 {
 	unsigned long flags;
+	uint32_t done_count, commit_count;
+	struct sde_fence *fc, *next;
+	LIST_HEAD(ready);
 
 	if (!ctx) {
 		SDE_ERROR("invalid ctx, %pK\n", ctx);
 		return;
 	}
 
-	spin_lock_irqsave(&ctx->lock, flags);
+	kref_get(&ctx->kref);
+	/* Select this event's fences before another event advances the timeline. */
+	spin_lock(&ctx->list_lock);
+	done_count = READ_ONCE(ctx->done_count);
+	commit_count = READ_ONCE(ctx->commit_count);
 	if (fence_event == SDE_FENCE_RESET_TIMELINE) {
-		if ((int)(ctx->done_count - ctx->commit_count) < 0) {
+		if ((s32)(done_count - commit_count) < 0) {
 			SDE_DEBUG(
 			  "timeline reset attempt! done count:%d commit:%d\n",
-				ctx->done_count, ctx->commit_count);
-			ctx->done_count = ctx->commit_count;
-			SDE_EVT32(ctx->drm_id, ctx->done_count,
-				ctx->commit_count, ktime_to_us(ts),
+				done_count, commit_count);
+			done_count = commit_count;
+			SDE_EVT32(ctx->drm_id, done_count,
+					commit_count, ktime_to_us(ts),
 				fence_event, SDE_EVTLOG_FUNC_CASE1);
 		} else {
-			spin_unlock_irqrestore(&ctx->lock, flags);
-			return;
+			goto unlock;
 		}
-	} else if ((int)(ctx->done_count - ctx->commit_count) < 0) {
-		++ctx->done_count;
+	} else if ((s32)(done_count - commit_count) < 0) {
+		++done_count;
 		SDE_DEBUG("fence_signal:done count:%d commit count:%d\n",
-					ctx->done_count, ctx->commit_count);
+					done_count, commit_count);
 	} else {
 		SDE_ERROR("extra signal attempt! done count:%d commit:%d\n",
-					ctx->done_count, ctx->commit_count);
-		SDE_EVT32(ctx->drm_id, ctx->done_count, ctx->commit_count,
+					done_count, commit_count);
+		SDE_EVT32(ctx->drm_id, done_count, commit_count,
 			ktime_to_us(ts), fence_event, SDE_EVTLOG_FATAL);
-		spin_unlock_irqrestore(&ctx->lock, flags);
-		return;
+		goto unlock;
 	}
+	list_for_each_entry_safe(fc, next, &ctx->fence_list_head, fence_list) {
+		if ((s32)(fc->base.seqno - done_count) > 0)
+			continue;
+		if (fence_event == SDE_FENCE_SIGNAL_ERROR) {
+			spin_lock_irqsave(&ctx->lock, flags);
+			if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT,
+					&fc->base.flags))
+				dma_fence_set_error(&fc->base, -EBUSY);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+		}
+		list_move_tail(&fc->fence_list, &ready);
+	}
+	/* Publish completion after errors are set, without an IRQ-off list walk. */
+	spin_lock_irqsave(&ctx->lock, flags);
+	WRITE_ONCE(ctx->done_count, done_count);
 	spin_unlock_irqrestore(&ctx->lock, flags);
+	spin_unlock(&ctx->list_lock);
 
-	SDE_EVT32(ctx->drm_id, ctx->done_count, ctx->commit_count,
-			ktime_to_us(ts));
+	SDE_EVT32(ctx->drm_id, done_count, commit_count, ktime_to_us(ts));
+	_sde_fence_trigger(ctx, &ready);
+	kref_put(&ctx->kref, sde_fence_destroy);
+	return;
 
-	_sde_fence_trigger(ctx, (fence_event == SDE_FENCE_SIGNAL_ERROR));
+unlock:
+	spin_unlock(&ctx->list_lock);
+	kref_put(&ctx->kref, sde_fence_destroy);
 }
 
 void sde_fence_timeline_status(struct sde_fence_context *ctx,
@@ -431,7 +441,7 @@ void sde_fence_timeline_status(struct sde_fence_context *ctx,
 
 void sde_fence_list_dump(struct dma_fence *fence, struct seq_file **s)
 {
-	char timeline_str[TIMELINE_VAL_LENGTH];
+	char timeline_str[TIMELINE_VAL_LENGTH] = "unknown";
 
 	if (fence->ops->timeline_value_str)
 		fence->ops->timeline_value_str(fence,

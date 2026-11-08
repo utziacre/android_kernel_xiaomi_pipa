@@ -129,6 +129,7 @@ struct drm_gem_object *msm_gem_prime_import(struct drm_device *dev,
 
 	if (!kms || !kms->funcs->get_address_space_device) {
 		DRM_ERROR("invalid kms ops\n");
+		ret = -EINVAL;
 		goto fail_put;
 	}
 
@@ -167,7 +168,8 @@ struct drm_gem_object *msm_gem_prime_import(struct drm_device *dev,
 	attach = dma_buf_attach(dma_buf, attach_dev);
 	if (IS_ERR(attach)) {
 		DRM_ERROR("dma_buf_attach failure, err=%ld\n", PTR_ERR(attach));
-		return ERR_CAST(attach);
+		ret = PTR_ERR(attach);
+		goto fail_put;
 	}
 
 	/*

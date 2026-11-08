@@ -477,11 +477,12 @@ int msm_atomic_prepare_fb(struct drm_plane *plane,
 	if (!new_state->fb)
 		return 0;
 
-	obj = msm_framebuffer_bo(new_state->fb, 0);
-	msm_obj = to_msm_bo(obj);
-	fence = reservation_object_get_excl_rcu(msm_obj->resv);
-
-	drm_atomic_set_fence_for_plane(new_state, fence);
+	if (!new_state->fence) {
+		obj = msm_framebuffer_bo(new_state->fb, 0);
+		msm_obj = to_msm_bo(obj);
+		fence = reservation_object_get_excl_rcu(msm_obj->resv);
+		drm_atomic_set_fence_for_plane(new_state, fence);
+	}
 
 	return msm_framebuffer_prepare(new_state->fb, kms->aspace);
 }
@@ -664,6 +665,9 @@ int msm_atomic_commit(struct drm_device *dev,
 	}
 
 	c = &to_kms_state(state)->commit;
+	/* A modeset backoff can reuse a state with a different set of planes. */
+	c->crtc_mask = 0;
+	c->plane_mask = 0;
 	/*
 	 * Figure out what crtcs we have:
 	 */
@@ -675,7 +679,8 @@ int msm_atomic_commit(struct drm_device *dev,
 	 */
 	for_each_oldnew_plane_in_state(state, plane, old_plane_state,
 			new_plane_state, i) {
-		if ((new_plane_state->fb != old_plane_state->fb)
+		if (!new_plane_state->fence &&
+				(new_plane_state->fb != old_plane_state->fb)
 				&& new_plane_state->fb) {
 			struct drm_gem_object *obj =
 				msm_framebuffer_bo(new_plane_state->fb, 0);
@@ -694,9 +699,12 @@ retry:
 		state->acquire_ctx);
 
 	if (ret == -EDEADLK) {
-		drm_modeset_backoff(state->acquire_ctx);
-		goto retry;
+		ret = drm_modeset_backoff(state->acquire_ctx);
+		if (!ret)
+			goto retry;
 	}
+	if (ret)
+		goto error;
 
 	/*
 	 * Wait for pending updates on any of the same crtc's and then

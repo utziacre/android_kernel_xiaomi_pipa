@@ -135,7 +135,8 @@ struct msm_gem_object {
 	struct list_head iova_list;
 
 	struct msm_gem_address_space *aspace;
-	bool in_active_list;
+	/* Owner of iova_list, protected by that address space's list_lock. */
+	struct msm_gem_address_space *active_aspace;
 
 	/* Indicates whether object  needs to request for
 	 * new pagetables due to cb switch

@@ -303,10 +303,11 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
 	for (i = 0; i < nr; i++) {
 		struct page *page = pvec->pages[i];
 		struct lruvec *lruvec;
+		struct mem_cgroup *memcg;
+		unsigned long flags;
 		bool was_mlocked, isolated = false;
 
-		lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-		spin_lock_irq(&lruvec->lru_lock);
+		lruvec = lock_page_memcg_lruvec(page, &memcg, &flags);
 
 		was_mlocked = TestClearPageMlocked(page);
 		if (was_mlocked) {
@@ -315,17 +316,16 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
 			 * so we can spare the get_page() here.
 			 */
 			isolated = __munlock_isolate_lru_page(page, false);
+			if (!isolated)
+				__munlock_isolation_failed(page);
 		} else {
 			delta_munlocked++;
 		}
 
-		spin_unlock_irq(&lruvec->lru_lock);
+		unlock_page_memcg_lruvec(lruvec, memcg, flags);
 
-		if (was_mlocked) {
-			if (isolated)
-				continue;
-			__munlock_isolation_failed(page);
-		}
+		if (isolated)
+			continue;
 
 		/*
 		 * We won't be munlocking this page in the next phase
@@ -336,7 +336,7 @@ static void __munlock_pagevec(struct pagevec *pvec, struct zone *zone)
 		pagevec_add(&pvec_putback, pvec->pages[i]);
 		pvec->pages[i] = NULL;
 	}
-	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
+	mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
 
 	/* Now we can release pins of pages that we are not munlocking */
 	pagevec_release(&pvec_putback);

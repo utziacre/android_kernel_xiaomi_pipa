@@ -32,6 +32,9 @@ static struct page *page_idle_get_page(unsigned long pfn)
 {
 	struct page *page;
 	struct lruvec *lruvec;
+	struct mem_cgroup *memcg;
+	unsigned long flags;
+	bool on_lru;
 
 	if (!pfn_valid(pfn))
 		return NULL;
@@ -40,14 +43,19 @@ static struct page *page_idle_get_page(unsigned long pfn)
 	if (!page || !PageLRU(page) ||
 	    !get_page_unless_zero(page))
 		return NULL;
+	/* The PFN may have been recycled before its reference was acquired. */
+	if (!PageLRU(page)) {
+		put_page(page);
+		return NULL;
+	}
 
-	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-	spin_lock_irq(&lruvec->lru_lock);
-	if (unlikely(!PageLRU(page))) {
+	lruvec = lock_page_memcg_lruvec(page, &memcg, &flags);
+	on_lru = PageLRU(page);
+	unlock_page_memcg_lruvec(lruvec, memcg, flags);
+	if (unlikely(!on_lru)) {
 		put_page(page);
 		page = NULL;
 	}
-	spin_unlock_irq(&lruvec->lru_lock);
 	return page;
 }
 

@@ -1888,16 +1888,17 @@ int isolate_lru_page(struct page *page)
 
 	if (PageLRU(page)) {
 		struct lruvec *lruvec;
+		struct mem_cgroup *memcg;
+		unsigned long flags;
 
-		lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-		spin_lock_irq(&lruvec->lru_lock);
+		lruvec = lock_page_memcg_lruvec(page, &memcg, &flags);
 		if (PageLRU(page)) {
 			get_page(page);
 			ClearPageLRU(page);
 			del_page_from_lru_list(page, lruvec);
 			ret = 0;
 		}
-		spin_unlock_irq(&lruvec->lru_lock);
+		unlock_page_memcg_lruvec(lruvec, memcg, flags);
 	}
 	return ret;
 }
@@ -7275,7 +7276,8 @@ int page_evictable(struct page *page)
 void check_move_unevictable_pages(struct page **pages, int nr_pages)
 {
 	struct lruvec *lruvec = NULL;
-	struct lruvec *page_lruvec;
+	struct mem_cgroup *memcg = NULL;
+	unsigned long flags = 0;
 	int pgscanned = 0;
 	int pgrescued = 0;
 	int i;
@@ -7284,13 +7286,7 @@ void check_move_unevictable_pages(struct page **pages, int nr_pages)
 		struct page *page = pages[i];
 
 		pgscanned++;
-		page_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-		if (page_lruvec != lruvec) {
-			if (lruvec)
-				spin_unlock_irq(&lruvec->lru_lock);
-			lruvec = page_lruvec;
-			spin_lock_irq(&lruvec->lru_lock);
-		}
+		lruvec = relock_page_memcg_lruvec(page, lruvec, &memcg, &flags);
 
 		if (!PageLRU(page) || !PageUnevictable(page))
 			continue;
@@ -7306,7 +7302,7 @@ void check_move_unevictable_pages(struct page **pages, int nr_pages)
 	if (lruvec) {
 		__count_vm_events(UNEVICTABLE_PGRESCUED, pgrescued);
 		__count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
-		spin_unlock_irq(&lruvec->lru_lock);
+		unlock_page_memcg_lruvec(lruvec, memcg, flags);
 	}
 }
 #endif /* CONFIG_SHMEM */

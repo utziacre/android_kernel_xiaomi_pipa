@@ -193,24 +193,18 @@ static void pagevec_lru_move_fn(struct pagevec *pvec,
 {
 	int i;
 	struct lruvec *lruvec = NULL;
-	struct lruvec *page_lruvec;
+	struct mem_cgroup *memcg = NULL;
 	unsigned long flags = 0;
 
 	for (i = 0; i < pagevec_count(pvec); i++) {
 		struct page *page = pvec->pages[i];
 
-		page_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-		if (page_lruvec != lruvec) {
-			if (lruvec)
-				spin_unlock_irqrestore(&lruvec->lru_lock, flags);
-			lruvec = page_lruvec;
-			spin_lock_irqsave(&lruvec->lru_lock, flags);
-		}
+		lruvec = relock_page_memcg_lruvec(page, lruvec, &memcg, &flags);
 
 		(*move_fn)(page, lruvec, arg);
 	}
 	if (lruvec)
-		spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+		unlock_page_memcg_lruvec(lruvec, memcg, flags);
 	release_pages(pvec->pages, pvec->nr);
 	pagevec_reinit(pvec);
 }
@@ -323,12 +317,13 @@ static inline void activate_page_drain(int cpu)
 void activate_page(struct page *page)
 {
 	struct lruvec *lruvec;
+	struct mem_cgroup *memcg;
+	unsigned long flags;
 
 	page = compound_head(page);
-	lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
-	spin_lock_irq(&lruvec->lru_lock);
+	lruvec = lock_page_memcg_lruvec(page, &memcg, &flags);
 	__activate_page(page, lruvec, NULL);
-	spin_unlock_irq(&lruvec->lru_lock);
+	unlock_page_memcg_lruvec(lruvec, memcg, flags);
 }
 #endif
 

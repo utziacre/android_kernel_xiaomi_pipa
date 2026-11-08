@@ -497,8 +497,9 @@ out:
  * @pgdat: pgdat the page lives on
  *
  * Hot path: called for every page that is added to, removed from or rotated
- * on an LRU, so keep it inline.  Relies on page->mem_cgroup not changing
- * while the page sits on an LRU, see mem_cgroup_move_account().
+ * on an LRU, so keep it inline. Callers must stabilize the page/memcg
+ * binding, e.g. through the page lock or lock_page_memcg(), before using
+ * the returned lruvec to acquire a lock or change an LRU list.
  */
 static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page,
 						struct pglist_data *pgdat)
@@ -1324,6 +1325,52 @@ void count_memcg_event_mm(struct mm_struct *mm, enum vm_event_item idx)
 {
 }
 #endif /* CONFIG_MEMCG */
+
+/*
+ * A page reference alone does not pin its memcg. Pair the LRU lock with the
+ * existing charge-migration guard, and keep that guard until after unlocking
+ * the lruvec. Uncharged swapcache pages can become charged under the root LRU
+ * lock, so recheck the binding after acquiring it.
+ */
+static inline struct lruvec *lock_page_memcg_lruvec(struct page *page,
+						    struct mem_cgroup **memcg,
+						    unsigned long *flags)
+{
+	struct lruvec *lruvec;
+
+	for (;;) {
+		*memcg = lock_page_memcg(page);
+		lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+		spin_lock_irqsave(&lruvec->lru_lock, *flags);
+		if (mem_cgroup_disabled() || page_memcg(page) == *memcg)
+			return lruvec;
+		spin_unlock_irqrestore(&lruvec->lru_lock, *flags);
+		__unlock_page_memcg(*memcg);
+	}
+}
+
+static inline void unlock_page_memcg_lruvec(struct lruvec *lruvec,
+					    struct mem_cgroup *memcg, unsigned long flags)
+{
+	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
+	__unlock_page_memcg(memcg);
+}
+
+/* Reuse both guards while batching pages of the same memcg and node. */
+static inline struct lruvec *relock_page_memcg_lruvec(struct page *page,
+						      struct lruvec *lruvec,
+						      struct mem_cgroup **memcg,
+						      unsigned long *flags)
+{
+	if (lruvec) {
+		if (page_pgdat(page) == lruvec_pgdat(lruvec) &&
+		    (mem_cgroup_disabled() || page_memcg(page) == *memcg))
+			return lruvec;
+		unlock_page_memcg_lruvec(lruvec, *memcg, *flags);
+	}
+
+	return lock_page_memcg_lruvec(page, memcg, flags);
+}
 
 /* idx can be of type enum memcg_stat_item or node_stat_item */
 static inline void __inc_memcg_state(struct mem_cgroup *memcg,

@@ -786,6 +786,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 	unsigned long nr_scanned = 0, nr_isolated = 0;
 	struct lruvec *lruvec;
 	struct lruvec *locked_lruvec = NULL;
+	struct mem_cgroup *memcg = NULL;
 	unsigned long flags = 0;
 	bool locked = false;
 	struct page *page = NULL, *valid_page = NULL;
@@ -847,11 +848,15 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		 * contention, to give chance to IRQs. Abort completely if
 		 * a fatal signal is pending.
 		 */
-		if (!(low_pfn % SWAP_CLUSTER_MAX)
-		    && compact_unlock_should_abort(locked ? &locked_lruvec->lru_lock : NULL,
-								flags, &locked, cc)) {
-			low_pfn = 0;
-			goto fatal_pending;
+		if (!(low_pfn % SWAP_CLUSTER_MAX)) {
+			if (locked) {
+				unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
+				locked = false;
+			}
+			if (compact_unlock_should_abort(NULL, flags, &locked, cc)) {
+				low_pfn = 0;
+				goto fatal_pending;
+			}
 		}
 
 		if (!pfn_valid_within(low_pfn))
@@ -921,8 +926,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 			if (unlikely(__PageMovable(page)) &&
 					!PageIsolated(page)) {
 				if (locked) {
-					spin_unlock_irqrestore(&locked_lruvec->lru_lock,
-							       flags);
+					unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
 					locked = false;
 				}
 
@@ -949,32 +953,46 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 		if (!(cc->gfp_mask & __GFP_FS) && page_mapping(page))
 			goto isolate_fail;
 
-		/*
-		 * The lock covers one lruvec, so retake it when the page moved
-		 * to another memcg's lruvec.
-		 */
+		/* Stabilize this PFN before looking at its memcg or lruvec. */
+		if (!get_page_unless_zero(page))
+			goto isolate_fail;
+		if (!PageLRU(page))
+			goto isolate_fail_put;
+
 		if (locked &&
-		    locked_lruvec != mem_cgroup_page_lruvec(page, page_pgdat(page))) {
-			spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
+		    (page_pgdat(page) != lruvec_pgdat(locked_lruvec) ||
+		     (!mem_cgroup_disabled() && page_memcg(page) != memcg))) {
+			unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
 			locked = false;
 		}
 
 		/* If we already hold the lock, we can skip some rechecking */
 		if (!locked) {
+retry_lruvec:
+			memcg = lock_page_memcg(page);
 			locked_lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
 			locked = compact_lock_irqsave(&locked_lruvec->lru_lock,
 								&flags, cc);
+			if (!mem_cgroup_disabled() && page_memcg(page) != memcg) {
+				unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
+				locked = false;
+				goto retry_lruvec;
+			}
 
 			/* Try get exclusive access under lock */
 			if (!skip_updated) {
 				skip_updated = true;
-				if (test_and_set_skip(cc, page, low_pfn))
+				if (test_and_set_skip(cc, page, low_pfn)) {
+					unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
+					locked = false;
+					put_page(page);
 					goto isolate_abort;
+				}
 			}
 
 			/* Recheck PageLRU and PageCompound under lock */
 			if (!PageLRU(page))
-				goto isolate_fail;
+				goto isolate_fail_put;
 
 			/*
 			 * Page become compound since the non-locked check,
@@ -983,7 +1001,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 			 */
 			if (unlikely(PageCompound(page))) {
 				low_pfn += (1UL << compound_order(page)) - 1;
-				goto isolate_fail;
+				goto isolate_fail_put;
 			}
 		}
 
@@ -991,7 +1009,10 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
 
 		/* Try isolate the page */
 		if (__isolate_lru_page(page, isolate_mode) != 0)
-			goto isolate_fail;
+			goto isolate_fail_put;
+
+		/* __isolate_lru_page() acquired the migration reference. */
+		put_page(page);
 
 		VM_BUG_ON_PAGE(PageCompound(page), page);
 
@@ -1018,6 +1039,13 @@ isolate_success:
 		}
 
 		continue;
+isolate_fail_put:
+		/* The temporary pin may be the last reference; drop all locks. */
+		if (locked) {
+			unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
+			locked = false;
+		}
+		put_page(page);
 isolate_fail:
 		if (!skip_on_failure)
 			continue;
@@ -1029,7 +1057,7 @@ isolate_fail:
 		 */
 		if (nr_isolated) {
 			if (locked) {
-				spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
+				unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
 				locked = false;
 			}
 			putback_movable_pages(&cc->migratepages);
@@ -1056,7 +1084,7 @@ isolate_fail:
 
 isolate_abort:
 	if (locked)
-		spin_unlock_irqrestore(&locked_lruvec->lru_lock, flags);
+		unlock_page_memcg_lruvec(locked_lruvec, memcg, flags);
 
 	/*
 	 * Updated the cached scanner pfn once the pageblock has been scanned

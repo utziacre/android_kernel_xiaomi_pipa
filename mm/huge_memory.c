@@ -2800,7 +2800,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 		if (mapping)
 			__dec_node_page_state(page, NR_SHMEM_THPS);
 		spin_unlock(&pgdata->split_queue_lock);
-		__split_huge_page(page, list, end, flags, mapping);
+		__split_huge_page(page, list, end, flags, mapping, lruvec);
 		/* __split_huge_page() dropped the i_mmap lock */
 		mapping = NULL;
 		if (PageSwapCache(head)) {

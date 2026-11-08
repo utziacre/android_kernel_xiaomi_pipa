@@ -919,6 +919,7 @@ typedef struct pglist_data {
 
 	wait_queue_head_t kshrinkd_wait;
 	struct task_struct *kshrinkd;
+	atomic_t kshrinkd_pending;
 
 	wait_queue_head_t kcompress_wait;
 	struct task_struct *kcompressd;

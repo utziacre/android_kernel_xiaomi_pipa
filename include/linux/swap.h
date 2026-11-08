@@ -386,6 +386,7 @@ extern void check_move_unevictable_pages(struct page **, int nr_pages);
 
 extern int kswapd_run(int nid);
 extern void kswapd_stop(int nid);
+void wake_up_kshrinkd(pg_data_t *pgdat);
 extern int kcompressd(void *p);
 
 #ifdef CONFIG_SWAP

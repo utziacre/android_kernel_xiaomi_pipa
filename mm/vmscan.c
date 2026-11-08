@@ -6826,6 +6826,13 @@ kswapd_try_sleep:
 	return 0;
 }
 
+void wake_up_kshrinkd(pg_data_t *pgdat)
+{
+	/* Publish one pending pass and coalesce requests until it starts. */
+	if (!atomic_xchg(&pgdat->kshrinkd_pending, 1))
+		wake_up_interruptible(&pgdat->kshrinkd_wait);
+}
+
 static int kshrinkd(void *pgdat)
 {
 	pg_data_t *p = pgdat;
@@ -6841,6 +6848,7 @@ static int kshrinkd(void *pgdat)
 
 		wait_event_freezable(p->kshrinkd_wait,
 				     (stop = kthread_should_stop()) ||
+				     atomic_read(&p->kshrinkd_pending) ||
 				     atomic_long_read(&kshrinkd_waiters));
 		if (unlikely(stop))
 			break;
@@ -6848,17 +6856,25 @@ static int kshrinkd(void *pgdat)
 		/* Shrink slabs on both kswapd and direct reclaimers' behalf */
 		while (1) {
 			struct mem_cgroup *memcg = NULL;
+			unsigned long freed = 0;
 
 			if (kthread_freezable_should_stop(NULL))
 				goto out;
+			atomic_set(&p->kshrinkd_pending, 0);
+			reclaim_state.reclaimed_slab = 0;
 
 			do {
-				shrink_slab(GFP_KERNEL, p->node_id, memcg, pri);
+				freed += shrink_slab(GFP_KERNEL, p->node_id, memcg, pri);
 				cond_resched();
 			} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 
-			if (!atomic_long_read(&kshrinkd_waiters))
+			if (!atomic_long_read(&kshrinkd_waiters) &&
+			    !atomic_read(&p->kshrinkd_pending))
 				break;
+
+			/* Back off only after even the most aggressive pass failed. */
+			if (!pri && !freed && !reclaim_state.reclaimed_slab)
+				schedule_timeout_idle(1);
 
 			/* Iterate down each possible priority and then wrap */
 			pri = pri ? pri - 1 : DEF_PRIORITY;
@@ -6921,7 +6937,7 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 	trace_mm_vmscan_wakeup_kswapd(pgdat->node_id, classzone_idx, order,
 				      gfp_flags);
 	wake_up_interruptible(&pgdat->kswapd_wait);
-	wake_up_interruptible(&pgdat->kshrinkd_wait);
+	wake_up_kshrinkd(pgdat);
 }
 
 #ifdef CONFIG_HIBERNATION

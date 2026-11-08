@@ -4513,16 +4513,15 @@ static void wake_all_kshrinkds(const struct alloc_context *ac)
 	struct zone *zone;
 
 	if (!IS_ENABLED(CONFIG_NUMA) || num_online_nodes() == 1) {
-		if (waitqueue_active(&NODE_DATA(0)->kshrinkd_wait))
-			wake_up_interruptible(&NODE_DATA(0)->kshrinkd_wait);
+		wake_up_kshrinkd(NODE_DATA(0));
 		return;
 	}
 
 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
 					ac->high_zoneidx, ac->nodemask) {
 		p = zone->zone_pgdat;
-		if (last_pgdat != p && waitqueue_active(&p->kshrinkd_wait))
-			wake_up_interruptible(&p->kshrinkd_wait);
+		if (last_pgdat != p)
+			wake_up_kshrinkd(p);
 		last_pgdat = p;
 	}
 }
@@ -4808,6 +4807,9 @@ restart:
 		}
 		if (!woke_kshrinkd) {
 			atomic_long_inc(&kshrinkd_waiters);
+			/* Publish the waiter before testing the worker waitqueue. */
+			smp_mb__after_atomic();
+			wake_all_kshrinkds(ac);
 			woke_kshrinkd = true;
 		}
 		if (!used_vmpressure)
@@ -7038,6 +7040,7 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 
 	init_waitqueue_head(&pgdat->kswapd_wait);
 	init_waitqueue_head(&pgdat->kshrinkd_wait);
+	atomic_set(&pgdat->kshrinkd_pending, 0);
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 
 	pgdat_page_ext_init(pgdat);

@@ -124,6 +124,11 @@
 #define SCHED_FEAT_UTIL_EST 1
 #define SCHED_FEAT_UTIL_EST_FASTUP 1
 
+/* Optional overflow diagnostics for the EEVDF weighted average. */
+#ifndef SCHED_FEAT_PARANOID_AVG
+#define SCHED_FEAT_PARANOID_AVG 0
+#endif
+
 /*
  * Fast pre-selection of CPU candidates for EAS.
  */
@@ -157,13 +162,13 @@
 /*
  * EEVDF: preserve lag when placing entities.
  *
- * Runtime switchable through /proc/sys/kernel/sched_place_lag, default on.
+ * Enabled by default through sysctl_sched_place_lag.
  * It is only useful together with the classic wakeup preemption rule
  * (sched_wakeup_preempt_gran != 0): with the EEVDF pick based rule a
  * preserved negative lag makes a freshly woken task ineligible and it loses
  * wakeup preemption entirely.
  */
-#define SCHED_FEAT_PLACE_LAG sysctl_sched_place_lag
+#define SCHED_FEAT_PLACE_LAG READ_ONCE(sysctl_sched_place_lag)
 
 /*
  * EEVDF: start new tasks with half a slice.

@@ -3334,7 +3334,6 @@ void walt_irq_work(struct irq_work *irq_work)
 	u64 wc;
 	bool is_migration = false, is_asym_migration = false;
 	u64 total_grp_load = 0, min_cluster_grp_load = 0;
-	int level = 0;
 	unsigned long flags, flag;
 
 	/* Am I the window rollover work or the migration work? */

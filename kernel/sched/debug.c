@@ -399,6 +399,7 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	struct rq *rq = cpu_rq(cpu);
 	struct sched_entity *last, *first, *root;
 	unsigned long flags;
+	unsigned int sum_shift;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	SEQ_printf(m, "\n");
@@ -423,6 +424,7 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 	zero_vruntime = cfs_rq->zero_vruntime;
 	sum_w_vruntime = cfs_rq->sum_w_vruntime;
 	sum_weight = cfs_rq->sum_weight;
+	sum_shift = cfs_rq->sum_shift;
 	avruntime = avg_vruntime(cfs_rq);
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 
@@ -436,6 +438,7 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			sum_w_vruntime);
 	SEQ_printf(m, "  .%-30s: %llu\n", "sum_weight",
 			(unsigned long long)sum_weight);
+	SEQ_printf(m, "  .%-30s: %u\n", "sum_shift", sum_shift);
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "avg_vruntime",
 			SPLIT_NS((s64)avruntime));
 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "right_vruntime",

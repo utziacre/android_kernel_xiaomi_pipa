@@ -296,6 +296,7 @@ void sched_init_granularity(void)
 	update_sysctl();
 }
 
+#ifndef CONFIG_64BIT
 #define WMULT_CONST	(~0U)
 #define WMULT_SHIFT	32
 
@@ -352,6 +353,14 @@ static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight
 
 	return mul_u64_u32_shr(delta_exec, fact, shift);
 }
+#else
+static u64 __calc_delta(u64 delta_exec, unsigned long weight,
+			struct load_weight *lw)
+{
+	/* Keep the full weight precision used by EEVDF's virtual average. */
+	return div64_u64(delta_exec * weight, lw->weight);
+}
+#endif
 
 
 const struct sched_class fair_sched_class;
@@ -644,30 +653,77 @@ static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
 /*
  * Weight of @se as used by the virtual time average.
  *
- * Note: unlike mainline, this kernel does not maintain a separate
- * hierarchical load (se->h_load), so use the (down-scaled) entity weight,
- * which yields the same ratios.
+ * Use the full entity weight so low-weight groups retain the same ratios
+ * as calc_delta_fair() and rescale_entity(). sum_shift is only used by
+ * the optional overflow diagnostic to reduce precision if necessary.
  */
 static inline unsigned long
-avg_vruntime_weight(struct cfs_rq *cfs_rq, struct sched_entity *se)
+avg_vruntime_weight(struct cfs_rq *cfs_rq, unsigned long weight)
 {
-	return scale_load_down(se->load.weight);
+#ifdef CONFIG_64BIT
+	if (cfs_rq->sum_shift)
+		weight = max(2UL, weight >> cfs_rq->sum_shift);
+#endif
+	return weight;
 }
 
 static inline void
+__sum_w_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	unsigned long weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+	s64 w_vruntime, key = entity_key(cfs_rq, se);
+
+	w_vruntime = key * (s64)weight;
+	WARN_ON_ONCE((w_vruntime >> 63) != (w_vruntime >> 62));
+	cfs_rq->sum_w_vruntime += w_vruntime;
+	cfs_rq->sum_weight += weight;
+}
+
+static void
+sum_w_vruntime_add_paranoid(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	unsigned long weight;
+	struct rb_node *node;
+	s64 key, tmp;
+
+again:
+	weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+	key = entity_key(cfs_rq, se);
+	if (check_mul_overflow(key, (s64)weight, &key))
+		goto overflow;
+	if (check_add_overflow(cfs_rq->sum_w_vruntime, key, &tmp))
+		goto overflow;
+	cfs_rq->sum_w_vruntime = tmp;
+	cfs_rq->sum_weight += weight;
+	return;
+
+overflow:
+	BUG_ON(cfs_rq->sum_shift >= 10);
+	cfs_rq->sum_shift++;
+
+	/* Sum each shifted weight separately to preserve the rounding rules. */
+	cfs_rq->sum_w_vruntime = 0;
+	cfs_rq->sum_weight = 0;
+	for (node = cfs_rq->tasks_timeline.rb_leftmost;
+	     node; node = rb_next(node))
+		__sum_w_vruntime_add(cfs_rq,
+				rb_entry(node, struct sched_entity, run_node));
+	goto again;
+}
+
+static void
 sum_w_vruntime_add(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	unsigned long weight = avg_vruntime_weight(cfs_rq, se);
-	s64 key = entity_key(cfs_rq, se);
-
-	cfs_rq->sum_w_vruntime += key * (s64)weight;
-	cfs_rq->sum_weight += weight;
+	if (IS_ENABLED(CONFIG_64BIT) && sched_feat(PARANOID_AVG))
+		sum_w_vruntime_add_paranoid(cfs_rq, se);
+	else
+		__sum_w_vruntime_add(cfs_rq, se);
 }
 
 static void
 sum_w_vruntime_sub(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	unsigned long weight = avg_vruntime_weight(cfs_rq, se);
+	unsigned long weight = avg_vruntime_weight(cfs_rq, se->load.weight);
 	s64 key = entity_key(cfs_rq, se);
 
 	cfs_rq->sum_w_vruntime -= key * (s64)weight;
@@ -712,7 +768,7 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
 		s64 runtime = cfs_rq->sum_w_vruntime;
 
 		if (curr) {
-			unsigned long w = avg_vruntime_weight(cfs_rq, curr);
+			unsigned long w = avg_vruntime_weight(cfs_rq, curr->load.weight);
 
 			runtime += entity_key(cfs_rq, curr) * (s64)w;
 			weight += w;
@@ -722,7 +778,7 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
 		if (runtime < 0)
 			runtime -= (weight - 1);
 
-		delta = div_s64(runtime, weight);
+		delta = div64_long(runtime, weight);
 	} else if (curr) {
 		/*
 		 * When there is but one element, it is the average.
@@ -766,7 +822,7 @@ static u64 ineligible_vruntime(struct cfs_rq *cfs_rq)
 		if (runtime < 0)
 			runtime -= (weight - 1);
 
-		delta = div_s64(runtime, weight);
+		delta = div64_long(runtime, weight);
 	}
 
 	return cfs_rq->zero_vruntime + delta + 1;
@@ -796,7 +852,7 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 	long load = cfs_rq->sum_weight;
 
 	if (curr && curr->on_rq) {
-		unsigned long weight = avg_vruntime_weight(cfs_rq, curr);
+		unsigned long weight = avg_vruntime_weight(cfs_rq, curr->load.weight);
 
 		avg += entity_key(cfs_rq, curr) * (s64)weight;
 		load += weight;
@@ -4826,11 +4882,11 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		 */
 		load = cfs_rq->sum_weight;
 		if (curr && curr->on_rq)
-			load += avg_vruntime_weight(cfs_rq, curr);
+			load += avg_vruntime_weight(cfs_rq, curr->load.weight);
 		if (WARN_ON_ONCE(!load))
 			load = 1;
 
-		weight = avg_vruntime_weight(cfs_rq, se);
+		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
 
 		/*
 		 * Rewrite, because the product (W + w_i)*vl'_i might
@@ -4840,7 +4896,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		 *        = (W*vl'_i + w_i*vl'_i) / W
 		 *        = vl'_i + w_i*vl'_i/W
 		 */
-		lag += div_s64(lag * (s64)weight, load);
+		lag += div64_long(lag * (s64)weight, load);
 
 		/*
 		 * A heavy entity (relative to the tree) will pull the
@@ -8849,15 +8905,15 @@ static void set_next_buddy(struct sched_entity *se)
  * was placed slightly behind the average can still preempt.
  */
 static int wakeup_preempt_entity(struct sched_entity *curr,
-				 struct sched_entity *se)
+				 struct sched_entity *se,
+				 unsigned int granularity)
 {
 	s64 gran, vdiff = curr->vruntime - se->vruntime;
 
 	if (vdiff <= 0)
 		return -1;
 
-	gran = calc_delta_fair(mult_frac(se->slice,
-					 sysctl_sched_wakeup_preempt_gran, 1024),
+	gran = calc_delta_fair(mult_frac(se->slice, granularity, 1024),
 			       se);
 	if (vdiff > gran)
 		return 1;
@@ -8873,6 +8929,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	int scale = cfs_rq->nr_running >= sched_nr_latency;
 	bool preempt_short = false;
 	int cse_is_idle, pse_is_idle;
+	unsigned int granularity;
 
 	if (unlikely(se == pse))
 		return;
@@ -8941,8 +8998,9 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (sched_feat(NEXT_BUDDY) && !preempt_short && !(wake_flags & WF_FORK))
 		set_next_buddy(pse);
 
-	if (sysctl_sched_wakeup_preempt_gran) {
-		if (wakeup_preempt_entity(se, pse) == 1)
+	granularity = READ_ONCE(sysctl_sched_wakeup_preempt_gran);
+	if (granularity) {
+		if (wakeup_preempt_entity(se, pse, granularity) == 1)
 			goto preempt;
 
 		/* The classic rule says no, skip the stricter EEVDF check */
@@ -8967,6 +9025,8 @@ update:
 
 preempt:
 	cancel_protect_slice(se);
+	if (preempt_short)
+		clear_buddies(cfs_rq, se);
 	resched_curr_lazy(rq);
 	/*
 	 * Only set the backward buddy when the current task is still
@@ -13056,6 +13116,7 @@ void init_cfs_rq(struct cfs_rq *cfs_rq)
 	cfs_rq->zero_vruntime = (u64)(-(1LL << 20));
 	cfs_rq->sum_w_vruntime = 0;
 	cfs_rq->sum_weight = 0;
+	cfs_rq->sum_shift = 0;
 #ifdef CONFIG_SMP
 	raw_spin_lock_init(&cfs_rq->removed.lock);
 #endif

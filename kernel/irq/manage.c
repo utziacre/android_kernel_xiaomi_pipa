@@ -879,7 +879,9 @@ static void
 irq_thread_check_affinity(struct irq_desc *desc, struct irqaction *action)
 {
 	cpumask_var_t mask;
+	const struct cpumask *affinity;
 	bool valid = true;
+	bool perf_critical = false;
 
 	if (!test_and_clear_bit(IRQTF_AFFINITY, &action->thread_flags))
 		return;
@@ -895,12 +897,26 @@ irq_thread_check_affinity(struct irq_desc *desc, struct irqaction *action)
 		return;
 	}
 
+	affinity = mask;
 	raw_spin_lock_irq(&desc->lock);
 	/*
 	 * This code is triggered unconditionally. Check the affinity
 	 * mask pointer. For CPU_MASK_OFFSTACK=n this is optimized out.
 	 */
-	if (cpumask_available(desc->irq_common_data.affinity)) {
+	if (irqd_has_set(&desc->irq_data, IRQD_PERF_CRITICAL) && desc->action) {
+		affinity = cpu_all_mask;
+		if (!READ_ONCE(perf_crit_suspended)) {
+			if (desc->action->flags & IRQF_PERF_AFFINE)
+				affinity = cpu_perf_mask;
+			else
+				affinity = cpu_prime_mask;
+
+			if (cpumask_intersects(affinity, cpu_online_mask))
+				perf_critical = true;
+			else
+				affinity = cpu_all_mask;
+		}
+	} else if (cpumask_available(desc->irq_common_data.affinity)) {
 		const struct cpumask *m;
 
 		m = irq_data_get_effective_affinity_mask(&desc->irq_data);
@@ -910,8 +926,14 @@ irq_thread_check_affinity(struct irq_desc *desc, struct irqaction *action)
 	}
 	raw_spin_unlock_irq(&desc->lock);
 
-	if (valid)
-		set_cpus_allowed_ptr(current, mask);
+	if (valid) {
+		/* Change our own flags and affinity outside the raw IRQ locks. */
+		if (perf_critical)
+			current->flags |= PF_PERF_CRITICAL;
+		else
+			current->flags &= ~PF_PERF_CRITICAL;
+		set_cpus_allowed_ptr(current, affinity);
+	}
 	free_cpumask_var(mask);
 }
 #else
@@ -1288,31 +1310,6 @@ setup_irq_thread(struct irqaction *new, unsigned int irq, bool secondary)
 	return 0;
 }
 
-static void affine_one_perf_thread(struct irqaction *action)
-{
-	const struct cpumask *mask;
-
-	if (!action->thread)
-		return;
-
-	if (action->flags & IRQF_PERF_AFFINE)
-		mask = cpu_perf_mask;
-	else
-		mask = cpu_prime_mask;
-
-	action->thread->flags |= PF_PERF_CRITICAL;
-	set_cpus_allowed_ptr(action->thread, mask);
-}
-
-static void unaffine_one_perf_thread(struct irqaction *action)
-{
-	if (!action->thread)
-		return;
-
-	action->thread->flags &= ~PF_PERF_CRITICAL;
-	set_cpus_allowed_ptr(action->thread, cpu_all_mask);
-}
-
 static void affine_one_perf_irq(struct irq_desc *desc, unsigned int perf_flag)
 {
 	const struct cpumask *mask;
@@ -1345,11 +1342,29 @@ static void affine_one_perf_irq(struct irq_desc *desc, unsigned int perf_flag)
 	*mask_index = cpu;
 }
 
+static void update_perf_irq_locked(struct irq_desc *desc, unsigned int perf_flag)
+{
+	lockdep_assert_held(&desc->lock);
+	lockdep_assert_held(&perf_irqs_lock);
+
+	if (perf_crit_suspended)
+		irq_set_affinity_locked(&desc->irq_data, cpu_all_mask, true);
+	else
+		affine_one_perf_irq(desc, perf_flag);
+
+	/* Task migration belongs to the IRQ thread, including secondary threads. */
+	irq_set_thread_affinity(desc);
+}
+
 void setup_perf_irq_locked(struct irq_desc *desc, unsigned int perf_flag)
 {
+	lockdep_assert_held(&desc->lock);
 	raw_spin_lock(&perf_irqs_lock);
-	list_add(&desc->perf_list, &perf_crit_irqs);
-	affine_one_perf_irq(desc, perf_flag);
+	if (!desc->perf_listed) {
+		list_add_tail_rcu(&desc->perf_list, &perf_crit_irqs);
+		desc->perf_listed = true;
+	}
+	update_perf_irq_locked(desc, perf_flag);
 	raw_spin_unlock(&perf_irqs_lock);
 }
 
@@ -1372,41 +1387,49 @@ void irq_set_perf_affinity(unsigned int irq, unsigned int perf_flag)
 	raw_spin_unlock_irqrestore(&desc->lock, flags);
 }
 
-void unaffine_perf_irqs(void)
+static void update_perf_irqs(void)
 {
 	struct irq_desc *desc;
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&perf_irqs_lock, flags);
-	perf_crit_suspended = true;
-	list_for_each_entry(desc, &perf_crit_irqs, perf_list) {
-		raw_spin_lock(&desc->lock);
-		irq_set_affinity_locked(&desc->irq_data, cpu_all_mask, true);
-		unaffine_one_perf_thread(desc->action);
-		raw_spin_unlock(&desc->lock);
+	/* Never take desc->lock while holding perf_irqs_lock. */
+	rcu_read_lock();
+	list_for_each_entry_rcu(desc, &perf_crit_irqs, perf_list) {
+		raw_spin_lock_irqsave(&desc->lock, flags);
+		raw_spin_lock(&perf_irqs_lock);
+		if (desc->perf_listed && desc->action)
+			update_perf_irq_locked(desc, desc->action->flags);
+		raw_spin_unlock(&perf_irqs_lock);
+		raw_spin_unlock_irqrestore(&desc->lock, flags);
 	}
+	rcu_read_unlock();
+}
+
+void unaffine_perf_irqs(void)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&perf_irqs_lock, flags);
+	WRITE_ONCE(perf_crit_suspended, true);
 	raw_spin_unlock_irqrestore(&perf_irqs_lock, flags);
+	update_perf_irqs();
 }
 
 void reaffine_perf_irqs(bool from_hotplug)
 {
-	struct irq_desc *desc;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&perf_irqs_lock, flags);
 	/* Don't allow hotplug to reaffine IRQs when resuming from suspend */
-	if (!from_hotplug || !perf_crit_suspended) {
-		perf_crit_suspended = false;
-		perf_cpu_index = -1;
-		prime_cpu_index = -1;
-		list_for_each_entry(desc, &perf_crit_irqs, perf_list) {
-			raw_spin_lock(&desc->lock);
-			affine_one_perf_irq(desc, desc->action->flags);
-			affine_one_perf_thread(desc->action);
-			raw_spin_unlock(&desc->lock);
-		}
+	if (from_hotplug && perf_crit_suspended) {
+		raw_spin_unlock_irqrestore(&perf_irqs_lock, flags);
+		return;
 	}
+	WRITE_ONCE(perf_crit_suspended, false);
+	perf_cpu_index = -1;
+	prime_cpu_index = -1;
 	raw_spin_unlock_irqrestore(&perf_irqs_lock, flags);
+	update_perf_irqs();
 }
 
 /*
@@ -1682,7 +1705,6 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
 		}
 
 		if (new->flags & (IRQF_PERF_AFFINE | IRQF_PRIME_AFFINE)) {
-			affine_one_perf_thread(new);
 			irqd_set(&desc->irq_data, IRQD_PERF_CRITICAL);
 			*old_ptr = new;
 		}
@@ -1714,8 +1736,7 @@ __setup_irq(unsigned int irq, struct irq_desc *desc, struct irqaction *new)
 				irq, omsk, nmsk);
 	}
 
-	if (!irqd_has_set(&desc->irq_data, IRQD_PERF_CRITICAL))
-		*old_ptr = new;
+	*old_ptr = new;
 
 	irq_pm_install_action(desc, new);
 
@@ -1822,6 +1843,7 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
 	unsigned irq = desc->irq_data.irq;
 	struct irqaction *action, **action_ptr;
 	unsigned long flags;
+	bool perf_removed = false;
 
 	WARN(in_interrupt(), "Trying to free IRQ %d from IRQ context!\n", irq);
 
@@ -1850,14 +1872,25 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
 		action_ptr = &action->next;
 	}
 
-	if (irqd_has_set(&desc->irq_data, IRQD_PERF_CRITICAL)) {
-		raw_spin_lock(&perf_irqs_lock);
-		list_del(&desc->perf_list);
-		raw_spin_unlock(&perf_irqs_lock);
-	}
-
 	/* Found it - now remove it from the list of entries: */
 	*action_ptr = action->next;
+
+	if (irqd_has_set(&desc->irq_data, IRQD_PERF_CRITICAL)) {
+		if (desc->action) {
+			/* Performance affinity is a policy for the shared IRQ line. */
+			desc->action->flags |= action->flags &
+				(IRQF_PERF_AFFINE | IRQF_PRIME_AFFINE);
+		} else {
+			raw_spin_lock(&perf_irqs_lock);
+			if (desc->perf_listed) {
+				list_del_rcu(&desc->perf_list);
+				desc->perf_listed = false;
+				perf_removed = true;
+			}
+			irqd_clear(&desc->irq_data, IRQD_PERF_CRITICAL);
+			raw_spin_unlock(&perf_irqs_lock);
+		}
+	}
 
 	irq_pm_remove_action(desc, action);
 
@@ -1890,6 +1923,12 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
 	 * and timing data is properly serialized.
 	 */
 	chip_bus_sync_unlock(desc);
+
+	/* Keep the removed link valid until affinity walkers have finished. */
+	if (perf_removed) {
+		synchronize_rcu();
+		INIT_LIST_HEAD(&desc->perf_list);
+	}
 
 	unregister_handler_proc(irq, action);
 

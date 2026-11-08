@@ -106,6 +106,7 @@ struct irq_desc {
 	struct module		*owner;
 	const char		*name;
 	struct list_head	perf_list;
+	bool			perf_listed;
 } ____cacheline_internodealigned_in_smp;
 
 #ifdef CONFIG_SPARSE_IRQ

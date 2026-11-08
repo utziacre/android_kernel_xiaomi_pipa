@@ -3902,7 +3902,7 @@ static inline int per_task_boost(struct task_struct *p)
 /**
  * update_tg_load_avg - update the tg's load avg
  * @cfs_rq: the cfs_rq whose avg changed
- * @force: update regardless of how small the difference
+ * @force: update regardless of the elapsed time or size of the difference
  *
  * This function 'ensures': tg->load_avg := \Sum tg->cfs_rq[]->avg.load.
  * However, because tg->load_avg is a global value there are performance
@@ -3916,7 +3916,8 @@ static inline int per_task_boost(struct task_struct *p)
  */
 static inline void update_tg_load_avg(struct cfs_rq *cfs_rq, int force)
 {
-	long delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
+	long delta;
+	u64 now;
 
 	/*
 	 * No need to update load_avg for root_task_group as it is not used.
@@ -3924,9 +3925,16 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq, int force)
 	if (cfs_rq->tg == &root_task_group)
 		return;
 
+	/* Publish at most once per PELT period during wakeup/migration bursts. */
+	now = rq_clock(rq_of(cfs_rq));
+	if (!force && now - cfs_rq->last_update_tg_load_avg < NSEC_PER_MSEC)
+		return;
+
+	delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
 	if (force || abs(delta) > cfs_rq->tg_load_avg_contrib / 64) {
 		atomic_long_add(delta, &cfs_rq->tg->load_avg);
 		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
+		cfs_rq->last_update_tg_load_avg = now;
 
 		trace_sched_load_tg(cfs_rq);
 	}
@@ -9911,6 +9919,11 @@ static void attach_tasks(struct lb_env *env)
 
 static inline bool cfs_rq_has_blocked(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	/* A rate-limited publication still needs another blocked-load pass. */
+	if (cfs_rq->tg_load_avg_contrib)
+		return true;
+#endif
 	if (cfs_rq->avg.load_avg)
 		return true;
 
@@ -9940,6 +9953,9 @@ static inline bool others_have_blocked(struct rq *rq)
 
 static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
 {
+	if (cfs_rq->tg_load_avg_contrib)
+		return false;
+
 	if (cfs_rq->load.weight)
 		return false;
 
@@ -9973,8 +9989,9 @@ static void update_blocked_averages(int cpu)
 	for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos) {
 		struct sched_entity *se;
 
-		if (update_cfs_rq_load_avg(cfs_rq_clock_pelt(cfs_rq), cfs_rq))
-			update_tg_load_avg(cfs_rq, 0);
+		update_cfs_rq_load_avg(cfs_rq_clock_pelt(cfs_rq), cfs_rq);
+		/* Retry publications even after the underlying PELT sum reaches 0. */
+		update_tg_load_avg(cfs_rq, 0);
 
 		/* Propagate pending load changes to the parent, if any: */
 		se = cfs_rq->tg->se[cpu];

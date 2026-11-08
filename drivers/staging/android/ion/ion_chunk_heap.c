@@ -19,8 +19,6 @@ struct ion_chunk_heap {
 	struct gen_pool *pool;
 	phys_addr_t base;
 	unsigned long chunk_size;
-	unsigned long size;
-	unsigned long allocated;
 };
 
 static int ion_chunk_heap_allocate(struct ion_heap *heap,
@@ -36,10 +34,13 @@ static int ion_chunk_heap_allocate(struct ion_heap *heap,
 	unsigned long num_chunks;
 	unsigned long allocated_size;
 
+	if (size > ULONG_MAX - (chunk_heap->chunk_size - 1))
+		return -EINVAL;
 	allocated_size = ALIGN(size, chunk_heap->chunk_size);
 	num_chunks = allocated_size / chunk_heap->chunk_size;
 
-	if (allocated_size > chunk_heap->size - chunk_heap->allocated)
+	if (!num_chunks || num_chunks > UINT_MAX ||
+	    allocated_size > gen_pool_avail(chunk_heap->pool))
 		return -ENOMEM;
 
 	table = kmalloc(sizeof(*table), GFP_KERNEL);
@@ -63,7 +64,6 @@ static int ion_chunk_heap_allocate(struct ion_heap *heap,
 	}
 
 	buffer->sg_table = table;
-	chunk_heap->allocated += allocated_size;
 	return 0;
 err:
 	sg = table->sgl;
@@ -85,11 +85,8 @@ static void ion_chunk_heap_free(struct ion_buffer *buffer)
 	struct sg_table *table = buffer->sg_table;
 	struct scatterlist *sg;
 	int i;
-	unsigned long allocated_size;
-
-	allocated_size = ALIGN(buffer->size, chunk_heap->chunk_size);
-
-	ion_heap_buffer_zero(buffer);
+	if (ion_heap_buffer_zero(buffer))
+		goto free_table;
 
 	if (ion_buffer_cached(buffer))
 		dma_sync_sg_for_device(NULL, table->sgl, table->nents,
@@ -99,7 +96,7 @@ static void ion_chunk_heap_free(struct ion_buffer *buffer)
 		gen_pool_free(chunk_heap->pool, page_to_phys(sg_page(sg)),
 			      sg->length);
 	}
-	chunk_heap->allocated -= allocated_size;
+free_table:
 	sg_free_table(table);
 	kfree(table);
 }
@@ -118,6 +115,13 @@ struct ion_heap *ion_chunk_heap_create(struct ion_platform_heap *heap_data)
 	int ret;
 	struct page *page;
 	size_t size;
+	unsigned long chunk_size = (unsigned long)heap_data->priv;
+
+	if (chunk_size < PAGE_SIZE || chunk_size > UINT_MAX ||
+	    !is_power_of_2(chunk_size) || !heap_data->size ||
+	    !IS_ALIGNED(heap_data->base, PAGE_SIZE) ||
+	    !IS_ALIGNED(heap_data->size, PAGE_SIZE))
+		return ERR_PTR(-EINVAL);
 
 	page = pfn_to_page(PFN_DOWN(heap_data->base));
 	size = heap_data->size;
@@ -132,7 +136,7 @@ struct ion_heap *ion_chunk_heap_create(struct ion_platform_heap *heap_data)
 	if (!chunk_heap)
 		return ERR_PTR(-ENOMEM);
 
-	chunk_heap->chunk_size = (unsigned long)heap_data->priv;
+	chunk_heap->chunk_size = chunk_size;
 	chunk_heap->pool = gen_pool_create(get_order(chunk_heap->chunk_size) +
 					   PAGE_SHIFT, -1);
 	if (!chunk_heap->pool) {
@@ -140,10 +144,11 @@ struct ion_heap *ion_chunk_heap_create(struct ion_platform_heap *heap_data)
 		goto error_gen_pool_create;
 	}
 	chunk_heap->base = heap_data->base;
-	chunk_heap->size = heap_data->size;
-	chunk_heap->allocated = 0;
-
-	gen_pool_add(chunk_heap->pool, chunk_heap->base, heap_data->size, -1);
+	ret = gen_pool_add(chunk_heap->pool, chunk_heap->base, heap_data->size, -1);
+	if (ret) {
+		gen_pool_destroy(chunk_heap->pool);
+		goto error_gen_pool_create;
+	}
 	chunk_heap->heap.ops = &chunk_heap_ops;
 	chunk_heap->heap.type = ION_HEAP_TYPE_CHUNK;
 	chunk_heap->heap.flags = ION_HEAP_FLAG_DEFER_FREE;

@@ -20,8 +20,6 @@ static const unsigned int orders[] = {0};
 
 #define NUM_ORDERS ARRAY_SIZE(orders)
 
-#define ION_KTHREAD_NICE_VAL 10
-
 enum ion_kthread_type {
 	ION_KTHREAD_UNCACHED,
 	ION_KTHREAD_CACHED,
@@ -33,17 +31,10 @@ struct ion_system_heap {
 	struct ion_page_pool *uncached_pools[MAX_ORDER];
 	struct ion_page_pool *cached_pools[MAX_ORDER];
 	/* worker threads to refill the pool */
-	struct task_struct *kworker[ION_MAX_NUM_KTHREADS];
+	struct ion_page_pool_worker kworker[ION_MAX_NUM_KTHREADS];
 	struct ion_page_pool *secure_pools[VMID_LAST][MAX_ORDER];
 	/* Prevents unnecessary page splitting */
 	struct mutex split_page_mutex;
-};
-
-struct page_info {
-	struct page *page;
-	bool from_pool;
-	unsigned int order;
-	struct list_head list;
 };
 
 int order_to_index(unsigned int order);

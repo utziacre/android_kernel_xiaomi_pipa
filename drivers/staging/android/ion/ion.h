@@ -19,10 +19,12 @@
 #include <linux/sched.h>
 #include <linux/kthread.h>
 #include <linux/shrinker.h>
+#include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/miscdevice.h>
 #include <linux/bitops.h>
 #include <linux/vmstat.h>
+#include <linux/wait.h>
 #include <linux/msm_dma_iommu_mapping.h>
 #include "ion_kernel.h"
 #include <uapi/linux/ion.h>
@@ -113,9 +115,6 @@ struct ion_vma_list {
 
 /**
  * struct ion_buffer - metadata for a particular buffer
- * @ref:		reference count
- * @node:		node in the ion_device buffers tree
- * @dev:		back pointer to the ion_device
  * @heap:		back pointer to the heap the buffer came from
  * @flags:		buffer specific flags
  * @private_flags:	internal buffer specific flags
@@ -124,17 +123,19 @@ struct ion_vma_list {
  *			a void *
  * @vaddr:		the kernel mapping, created on demand and torn down when
  *			the buffer is freed
- * @sg_table:		the sg table for the buffer if dmap_cnt is not zero
- * @vmas:		list of vma's mapping this buffer
+ * @sg_table:		backing pages, independent of device DMA mappings
+ * @attachments:	currently attached devices
+ * @map_freelist:	detached attachments cached for reuse by the same device
+ * @lock:		protects attachment lists, DMA mappings and cache maintenance
  */
-struct ion_dma_buf_attachment;
 struct ion_buffer {
 	struct ion_heap *heap;
 	struct sg_table *sg_table;
 	struct work_struct free;
-	struct ion_dma_buf_attachment *attachments;
+	struct list_head attachments;
 	struct list_head map_freelist;
-	spinlock_t freelist_lock;
+	/* Lock order: dma_buf.lock -> lock -> iommu_data.lock. */
+	struct mutex lock;
 	void *priv_virt;
 	void *vaddr;
 	unsigned int flags;
@@ -344,7 +345,7 @@ ion_secure_carveout_heap_create(struct ion_platform_heap *heap);
  * @count:		total number of pages/items in the pool
  * @high_items:		list of highmem items
  * @low_items:		list of lowmem items
- * @mutex:		lock protecting this struct and especially the count
+ * @lock:		lock protecting this struct and especially the count
  *			item list
  * @gfp_mask:		gfp_mask to use from alloc
  * @order:		order of pages in the pool
@@ -372,6 +373,53 @@ struct ion_page_pool {
 	struct plist_node list;
 	struct device *dev;
 };
+
+struct ion_page_pool_worker {
+	struct ion_page_pool **pools;
+	unsigned int num_pools;
+	struct task_struct *task;
+	wait_queue_head_t wait;
+	atomic_t pending;
+};
+
+struct ion_page_info {
+	struct page *page;
+	bool from_pool;
+	unsigned int order;
+	struct list_head list;
+};
+
+/* Keep allocation metadata batches within a 1 KiB slab. */
+#define ION_PAGE_INFO_BATCH \
+	((SZ_1K - sizeof(struct list_head)) / sizeof(struct ion_page_info))
+
+struct ion_page_info_batch {
+	struct list_head list;
+	struct ion_page_info entries[ION_PAGE_INFO_BATCH];
+};
+
+struct ion_page_info_pool {
+	struct list_head batches;
+	struct ion_page_info *entries;
+	unsigned int next;
+	unsigned int capacity;
+	struct ion_page_info inline_entries[8];
+};
+
+void ion_page_info_pool_init(struct ion_page_info_pool *pool);
+struct ion_page_info *ion_page_info_alloc(struct ion_page_info_pool *pool);
+void ion_page_info_pool_destroy(struct ion_page_info_pool *pool);
+
+int ion_page_pools_create(struct ion_page_pool **pools,
+			  const unsigned int *orders, unsigned int num_pools,
+			  bool cached, struct device *dev);
+void ion_page_pools_destroy(struct ion_page_pool **pools,
+			    unsigned int num_pools);
+int ion_page_pool_worker_start(struct ion_page_pool_worker *worker,
+			       struct ion_page_pool **pools,
+			       unsigned int num_pools, bool cached);
+void ion_page_pool_worker_stop(struct ion_page_pool_worker *worker);
+void ion_page_pool_worker_wake(struct ion_page_pool_worker *worker);
 
 struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order,
 					   bool cached);

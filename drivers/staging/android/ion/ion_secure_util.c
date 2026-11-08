@@ -8,6 +8,9 @@
 #include "ion_secure_util.h"
 #include "ion.h"
 
+/* Secure VM flags occupy a 32-bit userspace field. */
+#define ION_MAX_SECURE_VMIDS 32
+
 bool is_secure_vmid_valid(int vmid)
 {
 	return (vmid == VMID_CP_TOUCH ||
@@ -60,7 +63,7 @@ int get_secure_vmid(unsigned long flags)
 
 static unsigned int count_set_bits(unsigned long val)
 {
-	return ((unsigned int)bitmap_weight(&val, BITS_PER_LONG));
+	return hweight_long(val);
 }
 
 static int get_vmid(unsigned long flags)
@@ -137,7 +140,8 @@ int ion_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 {
 	u32 source_vmid = VMID_HLOS;
 	struct scatterlist *sg;
-	int *dest_perms;
+	int inline_perms[4];
+	int *dest_perms = inline_perms;
 	int i;
 	int ret = 0;
 
@@ -148,10 +152,10 @@ int ion_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 		goto out;
 	}
 
-	dest_perms = kcalloc(dest_nelems, sizeof(*dest_perms), GFP_KERNEL);
-	if (!dest_perms) {
-		ret = -ENOMEM;
-		goto out;
+	if (dest_nelems > ARRAY_SIZE(inline_perms)) {
+		dest_perms = kcalloc(dest_nelems, sizeof(*dest_perms), GFP_KERNEL);
+		if (!dest_perms)
+			return -ENOMEM;
 	}
 
 	for (i = 0; i < dest_nelems; i++)
@@ -170,115 +174,64 @@ int ion_hyp_assign_sg(struct sg_table *sgt, int *dest_vm_list,
 			SetPagePrivate(sg_page(sg));
 
 out_free_dest:
-	kfree(dest_perms);
+	if (dest_perms != inline_perms)
+		kfree(dest_perms);
 out:
 	return ret;
 }
 
 int ion_hyp_unassign_sg_from_flags(struct sg_table *sgt, unsigned long flags,
-				   bool set_page_private)
+				   bool clear_page_private)
 {
-	int ret = 0;
-	int *source_vm_list;
-	int source_nelems;
+	int vmids[ION_MAX_SECURE_VMIDS];
+	int count = count_set_bits(flags & ION_FLAGS_CP_MASK);
+	int ret;
 
-	source_nelems = count_set_bits(flags & ION_FLAGS_CP_MASK);
-	source_vm_list = kcalloc(source_nelems, sizeof(*source_vm_list),
-				 GFP_KERNEL);
-	if (!source_vm_list)
-		return -ENOMEM;
-	ret = ion_populate_vm_list(flags, source_vm_list, source_nelems);
-	if (ret) {
-		pr_err("%s: Failed to get secure vmids\n", __func__);
-		goto out_free_source;
-	}
-
-	ret = ion_hyp_unassign_sg(sgt, source_vm_list, source_nelems,
-				  set_page_private, false);
-
-out_free_source:
-	kfree(source_vm_list);
-	return ret;
+	ret = ion_populate_vm_list(flags, vmids, count);
+	if (ret)
+		return ret;
+	return ion_hyp_unassign_sg(sgt, vmids, count, clear_page_private, false);
 }
 
 int ion_hyp_assign_sg_from_flags(struct sg_table *sgt, unsigned long flags,
 				 bool set_page_private)
 {
-	int ret = 0;
-	int *dest_vm_list = NULL;
-	int dest_nelems;
+	int vmids[ION_MAX_SECURE_VMIDS];
+	int count = count_set_bits(flags & ION_FLAGS_CP_MASK);
+	int ret;
 
-	dest_nelems = count_set_bits(flags & ION_FLAGS_CP_MASK);
-	dest_vm_list = kcalloc(dest_nelems, sizeof(*dest_vm_list), GFP_KERNEL);
-	if (!dest_vm_list) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ret = ion_populate_vm_list(flags, dest_vm_list, dest_nelems);
-	if (ret) {
-		pr_err("%s: Failed to get secure vmid(s)\n", __func__);
-		goto out_free_dest_vm;
-	}
-
-	ret = ion_hyp_assign_sg(sgt, dest_vm_list, dest_nelems,
-				set_page_private);
-
-out_free_dest_vm:
-	kfree(dest_vm_list);
-out:
-	return ret;
+	ret = ion_populate_vm_list(flags, vmids, count);
+	if (ret)
+		return ret;
+	return ion_hyp_assign_sg(sgt, vmids, count, set_page_private);
 }
 
 bool hlos_accessible_buffer(struct ion_buffer *buffer)
 {
-	if ((buffer->flags & ION_FLAG_SECURE) &&
-	    !(buffer->flags & ION_FLAG_CP_HLOS) &&
-	    !(buffer->flags & ION_FLAG_CP_SPSS_HLOS_SHARED))
-		return false;
-	else if ((get_secure_vmid(buffer->flags) > 0) &&
-		 !(buffer->flags & ION_FLAG_CP_HLOS) &&
-		 !(buffer->flags & ION_FLAG_CP_SPSS_HLOS_SHARED))
-		return false;
-
-	return true;
+	if (buffer->flags & (ION_FLAG_CP_HLOS | ION_FLAG_CP_SPSS_HLOS_SHARED))
+		return true;
+	return !(buffer->flags & ION_FLAG_SECURE) &&
+		get_secure_vmid(buffer->flags) <= 0;
 }
 
 int ion_hyp_assign_from_flags(u64 base, u64 size, unsigned long flags)
 {
-	u32 *vmids, *modes;
-	u32 nr, i;
-	int ret = -EINVAL;
+	u32 vmids[ION_MAX_SECURE_VMIDS], modes[ION_MAX_SECURE_VMIDS];
 	u32 src_vm = VMID_HLOS;
+	unsigned int nr, i;
+	int ret;
 
+	if (flags & ~ION_FLAGS_CP_MASK)
+		return -EINVAL;
 	nr = count_set_bits(flags);
-	vmids = kcalloc(nr, sizeof(*vmids), GFP_KERNEL);
-	if (!vmids)
-		return -ENOMEM;
-
-	modes = kcalloc(nr, sizeof(*modes), GFP_KERNEL);
-	if (!modes) {
-		kfree(vmids);
-		return -ENOMEM;
-	}
-
-	if ((flags & ~ION_FLAGS_CP_MASK) ||
-	    ion_populate_vm_list(flags, vmids, nr)) {
-		pr_err("%s: Failed to parse secure flags 0x%lx\n", __func__,
-		       flags);
-		goto out;
-	}
-
+	ret = ion_populate_vm_list(flags, vmids, nr);
+	if (ret)
+		return ret;
 	for (i = 0; i < nr; i++)
 		modes[i] = msm_secure_get_vmid_perms(vmids[i]);
 
 	ret = hyp_assign_phys(base, size, &src_vm, 1, vmids, modes, nr);
 	if (ret)
-		pr_err("%s: Assign call failed, flags 0x%lx\n", __func__,
-		       flags);
-
-out:
-	kfree(modes);
-	kfree(vmids);
+		pr_err("%s: Assign call failed, flags 0x%lx\n", __func__, flags);
 	return ret;
 }

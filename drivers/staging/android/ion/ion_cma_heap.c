@@ -44,6 +44,9 @@ static int ion_cma_allocate(struct ion_heap *heap, struct ion_buffer *buffer,
 	int ret;
 	struct device *dev = heap->priv;
 
+	if (!size || size > UINT_MAX)
+		return -EINVAL;
+
 	if (ion_heap_is_cma_heap_type(buffer->heap->type) &&
 	    is_secure_allocation(buffer->flags)) {
 		pr_err("%s: CMA heap doesn't support secure allocations\n",
@@ -129,7 +132,7 @@ struct ion_heap *ion_cma_heap_create(struct ion_platform_heap *data)
 	struct ion_cma_heap *cma_heap;
 	struct device *dev = (struct device *)data->priv;
 
-	if (!dev->cma_area)
+	if (!dev || !dev->cma_area)
 		return ERR_PTR(-EINVAL);
 
 	cma_heap = kzalloc(sizeof(*cma_heap), GFP_KERNEL);
@@ -225,7 +228,7 @@ struct ion_heap *ion_cma_secure_heap_create(struct ion_platform_heap *data)
 	struct ion_cma_heap *cma_heap;
 	struct device *dev = (struct device *)data->priv;
 
-	if (!dev->cma_area)
+	if (!dev || !dev->cma_area)
 		return ERR_PTR(-EINVAL);
 
 	cma_heap = kzalloc(sizeof(*cma_heap), GFP_KERNEL);

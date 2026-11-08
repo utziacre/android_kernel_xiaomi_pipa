@@ -62,6 +62,9 @@ static int ion_carveout_heap_allocate(struct ion_heap *heap,
 	int ret;
 	struct device *dev = heap->priv;
 
+	if (size > UINT_MAX)
+		return -EINVAL;
+
 	table = kmalloc(sizeof(*table), GFP_KERNEL);
 	if (!table)
 		return -ENOMEM;
@@ -99,13 +102,15 @@ static void ion_carveout_heap_free(struct ion_buffer *buffer)
 	phys_addr_t paddr = page_to_phys(page);
 	struct device *dev = (struct device *)heap->priv;
 
-	ion_heap_buffer_zero(buffer);
+	if (ion_heap_buffer_zero(buffer))
+		goto free_table;
 
 	if (ion_buffer_cached(buffer))
 		ion_pages_sync_for_device(dev, page, buffer->size,
 					  DMA_BIDIRECTIONAL);
 
 	ion_carveout_free(heap, paddr, buffer->size);
+free_table:
 	sg_free_table(table);
 	kfree(table);
 }
@@ -129,6 +134,10 @@ __ion_carveout_heap_create(struct ion_platform_heap *heap_data,
 	size_t size;
 	struct device *dev = (struct device *)heap_data->priv;
 
+	if (!heap_data->size || !IS_ALIGNED(heap_data->base, PAGE_SIZE) ||
+	    !IS_ALIGNED(heap_data->size, PAGE_SIZE))
+		return ERR_PTR(-EINVAL);
+
 	page = pfn_to_page(PFN_DOWN(heap_data->base));
 	size = heap_data->size;
 
@@ -149,8 +158,13 @@ __ion_carveout_heap_create(struct ion_platform_heap *heap_data,
 		return ERR_PTR(-ENOMEM);
 	}
 	carveout_heap->base = heap_data->base;
-	gen_pool_add(carveout_heap->pool, carveout_heap->base, heap_data->size,
-		     -1);
+	ret = gen_pool_add(carveout_heap->pool, carveout_heap->base,
+			   heap_data->size, -1);
+	if (ret) {
+		gen_pool_destroy(carveout_heap->pool);
+		kfree(carveout_heap);
+		return ERR_PTR(ret);
+	}
 	carveout_heap->heap.ops = &carveout_heap_ops;
 	carveout_heap->heap.type = ION_HEAP_TYPE_CARVEOUT;
 	carveout_heap->heap.flags = ION_HEAP_FLAG_DEFER_FREE;
@@ -279,10 +293,13 @@ static int ion_sc_add_child(struct ion_sc_heap *manager,
 		goto out_free;
 
 	basep = of_get_address(phandle,  0, &size, NULL);
-	if (!basep)
+	if (!basep) {
+		of_node_put(phandle);
 		goto out_free;
+	}
 
 	base = of_translate_address(phandle, basep);
+	of_node_put(phandle);
 	if (base == OF_BAD_ADDR)
 		goto out_free;
 
@@ -344,6 +361,7 @@ ion_secure_carveout_heap_create(struct ion_platform_heap *heap_data)
 		if (ret) {
 			dev_err(dev, "Creating child pool %s failed\n",
 				np->name);
+			of_node_put(np);
 			goto err;
 		}
 	}

@@ -21,15 +21,17 @@
 void *ion_heap_map_kernel(struct ion_heap *heap,
 			  struct ion_buffer *buffer)
 {
-	struct scatterlist *sg;
-	int i, j;
+	struct sg_page_iter piter;
+	unsigned int i = 0;
 	void *vaddr;
 	pgprot_t pgprot;
 	struct sg_table *table = buffer->sg_table;
-	int npages = PAGE_ALIGN(buffer->size) / PAGE_SIZE;
-	struct page **pages = vmalloc(array_size(npages,
-						 sizeof(struct page *)));
-	struct page **tmp = pages;
+	size_t npages = buffer->size >> PAGE_SHIFT;
+	struct page **pages;
+
+	if (!npages || npages > UINT_MAX)
+		return ERR_PTR(-EINVAL);
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
 
 	if (!pages)
 		return ERR_PTR(-ENOMEM);
@@ -39,21 +41,24 @@ void *ion_heap_map_kernel(struct ion_heap *heap,
 	else
 		pgprot = pgprot_writecombine(PAGE_KERNEL);
 
-	for_each_sg(table->sgl, sg, table->nents, i) {
-		int npages_this_entry = PAGE_ALIGN(sg->length) / PAGE_SIZE;
-		struct page *page = sg_page(sg);
-
-		BUG_ON(i >= npages);
-		for (j = 0; j < npages_this_entry; j++)
-			*(tmp++) = page++;
+	for_each_sg_page(table->sgl, &piter, table->orig_nents, 0) {
+		if (i >= npages)
+			break;
+		pages[i++] = sg_page_iter_page(&piter);
 	}
+	if (i != npages)
+		goto invalid_table;
 	vaddr = vmap(pages, npages, VM_MAP, pgprot);
-	vfree(pages);
+	kvfree(pages);
 
 	if (!vaddr)
 		return ERR_PTR(-ENOMEM);
 
 	return vaddr;
+
+invalid_table:
+	kvfree(pages);
+	return ERR_PTR(-EINVAL);
 }
 
 void ion_heap_unmap_kernel(struct ion_heap *heap,
@@ -71,6 +76,10 @@ int ion_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
 	struct scatterlist *sg;
 	int i;
 	int ret;
+
+	if (vma->vm_pgoff > buffer->size >> PAGE_SHIFT ||
+	    vma_pages(vma) > (buffer->size >> PAGE_SHIFT) - vma->vm_pgoff)
+		return -EINVAL;
 
 	for_each_sg(table->sgl, sg, table->nents, i) {
 		struct page *page = sg_page(sg);
@@ -94,7 +103,7 @@ int ion_heap_map_user(struct ion_heap *heap, struct ion_buffer *buffer,
 		if (addr >= vma->vm_end)
 			return 0;
 	}
-	return 0;
+	return -EINVAL;
 }
 
 #define ION_HEAP_ZERO_BATCH	32
@@ -109,6 +118,26 @@ static int ion_heap_clear_pages(struct page **pages, int num, pgprot_t pgprot)
 	vunmap(addr);
 
 	return 0;
+}
+
+static int ion_heap_sglist_zero_batched(struct scatterlist *sgl,
+					unsigned int nents, pgprot_t pgprot)
+{
+	struct page *pages[ION_HEAP_ZERO_BATCH];
+	struct sg_page_iter piter;
+	unsigned int count = 0;
+	int ret;
+
+	for_each_sg_page(sgl, &piter, nents, 0) {
+		pages[count++] = sg_page_iter_page(&piter);
+		if (count == ARRAY_SIZE(pages)) {
+			ret = ion_heap_clear_pages(pages, count, pgprot);
+			if (ret)
+				return ret;
+			count = 0;
+		}
+	}
+	return count ? ion_heap_clear_pages(pages, count, pgprot) : 0;
 }
 
 /*
@@ -151,7 +180,7 @@ static int ion_heap_sglist_zero(struct scatterlist *sgl, unsigned int nents,
 
 	pages = kvmalloc_array(count, sizeof(*pages), GFP_KERNEL | __GFP_NOWARN);
 	if (!pages)
-		return -ENOMEM;
+		return ion_heap_sglist_zero_batched(sgl, nents, pgprot);
 
 	for_each_sg_page(sgl, &piter, nents, 0)
 		pages[i++] = sg_page_iter_page(&piter);
@@ -310,7 +339,7 @@ struct ion_heap *ion_heap_create(struct ion_platform_heap *heap_data)
 		pr_err("%s: error creating heap %s type %d base %pa size %zu\n",
 		       __func__, heap_data->name, heap_data->type,
 		       &heap_data->base, heap_data->size);
-		return ERR_PTR(-EINVAL);
+		return heap ? heap : ERR_PTR(-EINVAL);
 	}
 
 	heap->name = heap_data->name;

@@ -94,12 +94,12 @@ static int ion_system_secure_heap_allocate(struct ion_heap *heap,
 static void process_one_prefetch(struct ion_heap *sys_heap,
 				 struct prefetch_info *info)
 {
-	struct ion_buffer buffer;
+	struct ion_buffer buffer = {
+		.heap = sys_heap,
+		.size = PAGE_ALIGN(info->size),
+	};
 	int ret;
 	int vmid;
-
-	memset(&buffer, 0, sizeof(struct ion_buffer));
-	buffer.heap = sys_heap;
 
 	ret = sys_heap->ops->allocate(sys_heap, &buffer, info->size,
 					buffer.flags);
@@ -114,10 +114,14 @@ static void process_one_prefetch(struct ion_heap *sys_heap,
 		goto out;
 
 	ret = ion_hyp_assign_sg(buffer.sg_table, &vmid, 1, true);
-	if (ret == -EADDRNOTAVAIL)
-		goto out1;
-	else if (ret < 0)
+	if (ret == -EADDRNOTAVAIL) {
+		/* Keep pages quarantined, but release their metadata. */
+		sg_free_table(buffer.sg_table);
+		kfree(buffer.sg_table);
+		return;
+	} else if (ret < 0) {
 		goto out;
+	}
 
 	/* Now free it to the secure heap */
 	buffer.heap = sys_heap;
@@ -125,12 +129,6 @@ static void process_one_prefetch(struct ion_heap *sys_heap,
 
 out:
 	sys_heap->ops->free(&buffer);
-out1:
-	/*
-	 * The security state of the pages is unknown after a failure;
-	 * They can neither be added back to the secure pool nor buddy system.
-	 */
-	return;
 }
 
 /*
@@ -161,17 +159,19 @@ static void process_one_shrink(struct ion_system_secure_heap *secure_heap,
 			       struct ion_heap *sys_heap,
 			       struct prefetch_info *info)
 {
-	struct ion_buffer buffer;
+	struct ion_buffer buffer = {
+		.heap = &secure_heap->heap,
+		.flags = info->vmid,
+	};
 	size_t pool_size, size;
 	int ret;
-
-	memset(&buffer, 0, sizeof(struct ion_buffer));
-	buffer.heap = &secure_heap->heap;
-	buffer.flags = info->vmid;
 
 	pool_size = ion_system_secure_heap_page_pool_total(sys_heap,
 							   info->vmid);
 	size = min_t(size_t, pool_size, info->size);
+	if (!size)
+		return;
+	buffer.size = PAGE_ALIGN(size);
 	ret = sys_heap->ops->allocate(sys_heap, &buffer, size, buffer.flags);
 	if (ret) {
 		pr_debug("%s: Failed to shrink 0x%llx, ret = %d\n",
@@ -239,6 +239,10 @@ static int alloc_prefetch_info(struct ion_prefetch_regions __user *
 		err = get_user(info->size, ((u64 __user *)user_sizes + i));
 		if (err)
 			goto out_free;
+		if (!info->size || info->size > SIZE_MAX - (PAGE_SIZE - 1)) {
+			err = -EINVAL;
+			goto out_free;
+		}
 
 		info->vmid = vmid;
 		info->shrink = shrink;
@@ -270,9 +274,10 @@ static int __ion_system_secure_heap_resize(struct ion_heap *heap, void *ptr,
 		return -EINVAL;
 
 	for (i = 0; i < data->nr_regions; i++) {
-		struct ion_prefetch_regions *r;
+		struct ion_prefetch_regions __user *r;
 
-		r = (struct ion_prefetch_regions *)data->regions + i;
+		r = (struct ion_prefetch_regions __user *)
+			u64_to_user_ptr(data->regions) + i;
 		ret = alloc_prefetch_info(r, shrink, &items);
 		if (ret)
 			goto out_free;
@@ -360,6 +365,10 @@ struct ion_heap *ion_system_secure_heap_create(struct ion_platform_heap *unused)
 	heap->heap.ops = &system_secure_heap_ops;
 	heap->heap.type = (enum ion_heap_type)ION_HEAP_TYPE_SYSTEM_SECURE;
 	heap->sys_heap = get_ion_heap(ION_SYSTEM_HEAP_ID);
+	if (!heap->sys_heap) {
+		kfree(heap);
+		return ERR_PTR(-ENODEV);
+	}
 
 	heap->destroy_heap = false;
 	heap->work_lock = (spinlock_t)__SPIN_LOCK_UNLOCKED(heap->work_lock);
@@ -389,6 +398,8 @@ struct page *split_page_from_secure_pool(struct ion_system_heap *heap,
 	int i, j;
 	struct page *page;
 	unsigned int order;
+	struct ion_page_pool *pool =
+		heap->secure_pools[get_secure_vmid(buffer->flags)][order_to_index(0)];
 
 	mutex_lock(&heap->split_page_mutex);
 
@@ -402,7 +413,7 @@ struct page *split_page_from_secure_pool(struct ion_system_heap *heap,
 	if (!IS_ERR(page))
 		goto got_page;
 
-	for (i = NUM_ORDERS - 2; i >= 0; i--) {
+	for (i = (int)NUM_ORDERS - 2; i >= 0; i--) {
 		order = orders[i];
 		page = alloc_from_secure_pool_order(heap, buffer, order);
 		if (IS_ERR(page))
@@ -418,7 +429,7 @@ struct page *split_page_from_secure_pool(struct ion_system_heap *heap,
 	if (!IS_ERR(page)) {
 		for (j = 1; j < (1 << order); j++) {
 			SetPagePrivate(page + j);
-			free_buffer_page(heap, buffer, page + j, 0);
+			ion_page_pool_free(pool, page + j);
 		}
 	}
 got_page:
@@ -490,6 +501,8 @@ out3:
 	 * The security state of the pages is unknown after a failure;
 	 * They can neither be added back to the secure pool nor buddy system.
 	 */
+	list_for_each_entry_safe(page, tmp, &pages, lru)
+		list_del(&page->lru);
 	sg_free_table(&sgt);
 	return 0;
 }

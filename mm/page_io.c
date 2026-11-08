@@ -267,6 +267,8 @@ static bool kcompressd_store(struct page *page, struct writeback_control *wbc)
 	pg_data_t *pgdat;
 	unsigned long flags;
 	unsigned int next;
+	unsigned int queued;
+	bool needwake;
 
 	if (!current_is_kswapd() || !wbc->for_reclaim ||
 	    wbc->sync_mode != WB_SYNC_NONE ||
@@ -281,11 +283,15 @@ static bool kcompressd_store(struct page *page, struct writeback_control *wbc)
 		return false;
 
 	spin_lock_irqsave(&pgdat->kcompress_lock, flags);
+	queued = (pgdat->kcompress_head + KCOMPRESS_QUEUE_SIZE -
+		  pgdat->kcompress_tail) % KCOMPRESS_QUEUE_SIZE;
 	next = (pgdat->kcompress_head + 1) % KCOMPRESS_QUEUE_SIZE;
-	if (next == pgdat->kcompress_tail) {
+	/* Keep at most one reclaim batch pending; the caller handles excess. */
+	if (queued >= SWAP_CLUSTER_MAX || next == pgdat->kcompress_tail) {
 		spin_unlock_irqrestore(&pgdat->kcompress_lock, flags);
 		return false;
 	}
+	needwake = !queued;
 
 	get_page(page);
 	set_page_writeback(page);
@@ -295,7 +301,8 @@ static bool kcompressd_store(struct page *page, struct writeback_control *wbc)
 	pgdat->kcompress_head = next;
 	spin_unlock_irqrestore(&pgdat->kcompress_lock, flags);
 
-	wake_up_interruptible(&pgdat->kcompress_wait);
+	if (needwake)
+		wake_up_interruptible(&pgdat->kcompress_wait);
 	return true;
 }
 
@@ -315,13 +322,17 @@ int kcompressd(void *p)
 		if (kthread_should_stop())
 			break;
 
-		while (kcompressd_dequeue(pgdat, &page))
+		while (kcompressd_dequeue(pgdat, &page)) {
 			kcompressd_swapout(page);
+			cond_resched();
+		}
 	}
 
 	/* Drain anything queued while the thread was being stopped. */
-	while (kcompressd_dequeue(pgdat, &page))
+	while (kcompressd_dequeue(pgdat, &page)) {
 		kcompressd_swapout(page);
+		cond_resched();
+	}
 
 	return 0;
 }

@@ -1944,6 +1944,7 @@ static int find_lowest_rq(struct task_struct *task)
 {
 	struct sched_domain *sd;
 	struct cpumask *lowest_mask = this_cpu_cpumask_var_ptr(local_cpu_mask);
+	bool (*fitness_fn)(struct task_struct *p, int cpu) = NULL;
 	int this_cpu = smp_processor_id();
 	int cpu = -1;
 
@@ -1954,9 +1955,20 @@ static int find_lowest_rq(struct task_struct *task)
 	if (task->nr_cpus_allowed == 1)
 		return -1; /* No other targets possible */
 
+	/* Capacity filtering is useful only with asymmetric uclamp support. */
+	if (IS_ENABLED(CONFIG_UCLAMP_TASK) &&
+	    static_branch_unlikely(&sched_asym_cpucapacity))
+		fitness_fn = rt_task_fits_capacity;
+
 	if (!cpupri_find(&task_rq(task)->rd->cpupri, task, lowest_mask,
-			 rt_task_fits_capacity))
+			 fitness_fn))
 		return -1; /* No targets found */
+
+	/* A sole candidate needs neither energy scoring nor topology walks. */
+	cpu = cpumask_first(lowest_mask);
+	if (cpumask_next(cpu, lowest_mask) >= nr_cpu_ids)
+		return cpu;
+	cpu = -1;
 
 	if (static_branch_unlikely(&sched_energy_present))
 		cpu = rt_energy_aware_wake_cpu(task);

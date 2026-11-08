@@ -7,7 +7,6 @@
 #include <linux/cpufreq.h>
 #include <linux/list_sort.h>
 #include <linux/jiffies.h>
-#include <linux/delay.h>
 #include <linux/sched/stat.h>
 #include <trace/events/sched.h>
 #include "sched.h"
@@ -26,39 +25,6 @@ const char *migrate_type_names[] = {"GROUP_TO_RQ", "RQ_TO_GROUP",
 #define SCHED_ACCOUNT_WAIT_TIME 1
 
 #define EARLY_DETECTION_DURATION 9500000
-
-/*
- * Frequent yielders.
- *
- * A thread that keeps calling sched_yield() while it waits for the next
- * frame does not give its CPU to anything useful: the yield puts it back on
- * the runqueue and it is picked again almost immediately, burning cycles
- * that nothing in the load accounting can tell apart from real work. When a
- * whole render loop does it at once the cluster is saturated by threads that
- * are not making progress, so the frequency goes to the top for nothing.
- *
- * There is no metric that separates this from being busy - a spin loop has
- * high IPC, few stalls and good cache behaviour - so do not measure it.
- * sched_yield() is an explicit statement that the caller has nothing to do,
- * so take it at its word and turn the yield into a real sleep long enough
- * to reach the next frame boundary instead.
- */
-#define YIELD_CNT_MASK				0x7f
-#define YIELD_INDUCED_SLEEP			BIT(7)
-#define MAX_YIELD_CNT_PER_TASK_THR		25
-#define YIELD_WINDOW_SIZE_NSEC			(14ULL * NSEC_PER_MSEC)
-#define YIELD_GRACE_PERIOD_NSEC			(4ULL * NSEC_PER_MSEC)
-#define YIELD_SLEEP_TIME_USEC			250
-#define FORCE_MAX_YIELD_CNT_GLOBAL_THR		500
-#define FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW	2
-#define FORCE_MAX_YIELD_SLEEP_CNT_GLOBAL_THR	4
-#define MIN_FRAME_YIELD_INTERVAL_NSEC		NSEC_PER_MSEC
-#define YIELD_SLEEP_HEADROOM			300000ULL
-
-/* Frame sizes the ravg window is snapped to by sched_set_refresh_rate() */
-#define WALT_FRAME120_NSEC			8333333ULL
-#define WALT_FRAME90_NSEC			11111111ULL
-#define WALT_FRAME60_NSEC			16666667ULL
 
 static ktime_t ktime_last;
 static bool sched_ktime_suspended;
@@ -2102,140 +2068,6 @@ update_task_rq_cpu_cycles(struct task_struct *p, struct rq *rq, int event,
 
 }
 
-/* Frequent yielder state, see the comment with the thresholds above */
-static u8 contiguous_yielding_windows;
-static unsigned int total_yield_cnt;
-static unsigned int total_sleep_cnt;
-static u64 yield_counting_window_ts;
-static DEFINE_PER_CPU(unsigned int, walt_yield_to_sleep);
-
-/* Frame length the ravg window has been sized to */
-static u64 walt_frame_time(void)
-{
-	if (sched_ravg_window <= 8000000)
-		return WALT_FRAME120_NSEC;
-	if (sched_ravg_window <= 12000000)
-		return WALT_FRAME90_NSEC;
-
-	return WALT_FRAME60_NSEC;
-}
-
-/*
- * Sleep out the rest of the frame instead of yielding. Two adjacent yields
- * a millisecond or more apart mark the start of the waiting part of a frame,
- * so what is left to sleep is the frame length minus the time already spent
- * in it, less a headroom to make sure the task is runnable before its work
- * arrives. Yields closer together than that belong to a burst inside the
- * frame and only make the budget go up once a new frame is entered.
- */
-static void walt_inject_sleep(struct task_struct *p)
-{
-	struct ravg *ravg = &p->ravg;
-	u64 now, frame, delta, sleep_nsec = 0;
-
-	now = sched_ktime_clock();
-
-	if (now > ravg->yield_ts + MIN_FRAME_YIELD_INTERVAL_NSEC) {
-		frame = walt_frame_time();
-		delta = now - ravg->yield_ts;
-		ravg->yield_total_sleep_usec = 0;
-		if (frame > delta + YIELD_SLEEP_HEADROOM) {
-			sleep_nsec = (frame - delta) - YIELD_SLEEP_HEADROOM;
-			ravg->yield_total_sleep_usec =
-				div_u64(sleep_nsec, NSEC_PER_USEC);
-		}
-	}
-	ravg->yield_ts = now;
-
-	if (ravg->yield_total_sleep_usec < YIELD_SLEEP_TIME_USEC)
-		return;
-
-	this_cpu_inc(walt_yield_to_sleep);
-	ravg->yield_state |= YIELD_INDUCED_SLEEP;
-	total_sleep_cnt++;
-
-	usleep_range(YIELD_SLEEP_TIME_USEC, YIELD_SLEEP_TIME_USEC);
-	ravg->yield_total_sleep_usec -= YIELD_SLEEP_TIME_USEC;
-}
-
-/*
- * Called from the sched_yield() syscall. Returns true when the yield was
- * replaced by a sleep, in which case the caller must not yield: putting the
- * task straight back on the runqueue is the whole problem.
- */
-bool walt_do_sched_yield(void)
-{
-	struct ravg *ravg;
-
-	if (!sched_ravg_window)
-		return false;
-
-	/* Only fair tasks, and never the idle task */
-	if (current->prio < MAX_RT_PRIO || is_idle_task(current))
-		return false;
-
-	ravg = &current->ravg;
-
-	if ((ravg->yield_state & YIELD_CNT_MASK) < MAX_YIELD_CNT_PER_TASK_THR) {
-		ravg->yield_state++;
-		return false;
-	}
-
-	total_yield_cnt++;
-
-	/*
-	 * One task yielding is normal, a whole cluster doing it is a spin
-	 * loop. Wait for the counter to stay high across several windows
-	 * before changing behaviour.
-	 */
-	if (contiguous_yielding_windows < FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW)
-		return false;
-
-	walt_inject_sleep(current);
-
-	return true;
-}
-
-/**
- * walt_account_yields - Close out a yield counting window.
- * @wallclock: start of the window that just began
- *
- * Counts how many windows in a row have had more than the threshold number
- * of yields across the whole system. Called once per window boundary, from
- * the same place that rolls the ravg window over.
- */
-static void walt_account_yields(u64 wallclock)
-{
-	u64 delta = wallclock - yield_counting_window_ts;
-	unsigned int thr_wake = FORCE_MAX_YIELD_CNT_GLOBAL_THR;
-	unsigned int thr_sleep = FORCE_MAX_YIELD_SLEEP_CNT_GLOBAL_THR;
-
-	if (delta <= YIELD_WINDOW_SIZE_NSEC)
-		return;
-
-	/*
-	 * A gap longer than the grace period means the window was not being
-	 * updated for a while; scale the thresholds so that a quiet stretch
-	 * is not read as a busy one.
-	 */
-	if (delta > YIELD_WINDOW_SIZE_NSEC + YIELD_GRACE_PERIOD_NSEC) {
-		thr_wake = div64_u64(delta * thr_wake, YIELD_WINDOW_SIZE_NSEC);
-		thr_sleep = div64_u64(delta * thr_sleep, YIELD_WINDOW_SIZE_NSEC);
-	}
-
-	if (total_yield_cnt >= thr_wake || total_sleep_cnt >= thr_sleep / 2) {
-		if (contiguous_yielding_windows <
-		    FORCE_MIN_CONTIGUOUS_YIELDING_WINDOW)
-			contiguous_yielding_windows++;
-	} else {
-		contiguous_yielding_windows = 0;
-	}
-
-	total_yield_cnt = 0;
-	total_sleep_cnt = 0;
-	yield_counting_window_ts = wallclock;
-}
-
 static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
 {
 	u64 result;
@@ -2246,7 +2078,6 @@ static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
 	result = atomic64_cmpxchg(&walt_irq_work_lastq_ws, old_window_start,
 				   rq->window_start);
 	if (result == old_window_start) {
-		walt_account_yields(rq->window_start);
 		walt_irq_work_queue(&walt_cpufreq_irq_work);
 		trace_walt_window_rollover(rq->window_start);
 	}

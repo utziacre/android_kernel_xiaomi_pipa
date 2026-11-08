@@ -6388,14 +6388,6 @@ static void do_sched_yield(void)
 
 SYSCALL_DEFINE0(sched_yield)
 {
-	/*
-	 * A task that keeps yielding is waiting for something that is not
-	 * there yet. WALT turns that into a sleep, in which case yielding on
-	 * top of it would just put the task back where it started.
-	 */
-	if (walt_do_sched_yield())
-		return 0;
-
 	do_sched_yield();
 	return 0;
 }

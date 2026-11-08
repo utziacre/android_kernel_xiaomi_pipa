@@ -3103,7 +3103,6 @@ static inline void walt_fixup_cum_window_demand(struct rq *rq, s64 scaled_delta)
 extern unsigned long thermal_cap(int cpu);
 
 extern void clear_walt_request(int cpu);
-extern bool walt_do_sched_yield(void);
 
 extern enum sched_boost_policy sched_boost_policy(void);
 extern void sched_boost_parse_dt(void);
@@ -3260,8 +3259,6 @@ static inline int alloc_related_thread_groups(void) { return 0; }
 
 static inline void walt_fixup_cum_window_demand(struct rq *rq,
 						s64 scaled_delta) { }
-
-static inline bool walt_do_sched_yield(void) { return false; }
 
 #ifdef CONFIG_SMP
 static inline unsigned long thermal_cap(int cpu)

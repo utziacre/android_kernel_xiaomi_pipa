@@ -1600,7 +1600,6 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags,
 	if (static_branch_unlikely(&sched_energy_present) || may_not_preempt || test || !rt_task_fits_capacity(p, cpu)) {
 		int target = find_lowest_rq(p);
 
-
 		/*
 		 * Check once for losing a race with the other core's irq
 		 * handler. This does not happen frequently, but it can avoid
@@ -1611,6 +1610,11 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags,
 			if (task_may_not_preempt(tgt_task, target))
 				target = find_lowest_rq(p);
 		}
+
+		/* A capacity-only search must not cause another unfit placement. */
+		if (!test && !may_not_preempt && target != -1 &&
+		    !rt_task_fits_capacity(p, target))
+			goto out_unlock;
 
 		/*
 		 * If cpu is non-preemptible, prefer remote cpu
@@ -1623,6 +1627,8 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags,
 		    p->prio < cpu_rq(target)->rt.highest_prio.curr))
 			cpu = target;
 	}
+
+out_unlock:
 	rcu_read_unlock();
 
 out:
@@ -1802,8 +1808,7 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
 static int pick_rt_task(struct rq *rq, struct task_struct *p, int cpu)
 {
 	if (!task_running(rq, p) &&
-	    cpumask_test_cpu(cpu, p->cpus_ptr) &&
-	    rt_task_fits_capacity(p, cpu))
+	    cpumask_test_cpu(cpu, p->cpus_ptr))
 		return 1;
 
 	return 0;
@@ -2482,7 +2487,7 @@ static void task_woken_rt(struct rq *rq, struct task_struct *p)
 			    (rq->curr->nr_cpus_allowed < 2 ||
 			     rq->curr->prio <= p->prio);
 
-	if (need_to_push || !rt_task_fits_capacity(p, cpu_of(rq)))
+	if (need_to_push)
 		push_rt_tasks(rq);
 }
 
@@ -2555,10 +2560,7 @@ static void switched_to_rt(struct rq *rq, struct task_struct *p)
 	 */
 	if (task_on_rq_queued(p) && rq->curr != p) {
 #ifdef CONFIG_SMP
-		bool need_to_push = rq->rt.overloaded ||
-				    !rt_task_fits_capacity(p, cpu_of(rq));
-
-		if (p->nr_cpus_allowed > 1 && need_to_push)
+		if (p->nr_cpus_allowed > 1 && rq->rt.overloaded)
 			rt_queue_push_tasks(rq);
 #endif /* CONFIG_SMP */
 		if (p->prio < rq->curr->prio && cpu_online(cpu_of(rq)))

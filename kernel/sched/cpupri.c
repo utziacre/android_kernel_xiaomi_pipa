@@ -175,6 +175,11 @@ retry:
 		drop_nopreempts = false;
 		goto retry;
 	}
+
+	/* Prefer running at a lower capacity over waiting behind higher prio. */
+	if (fitness_fn)
+		return cpupri_find(cp, p, lowest_mask, NULL);
+
 	return 0;
 }
 

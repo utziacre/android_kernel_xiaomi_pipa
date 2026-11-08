@@ -260,7 +260,9 @@ void rcu_bh_qs(void)
 
 	/* Callers to this function, rcu_preempt_qs(), must disable irqs. */
 	local_irq_save(flags);
-	rcu_preempt_qs();
+	/* The scheduler tick can interrupt an active preemptible reader. */
+	if (!current->rcu_read_lock_nesting)
+		rcu_preempt_qs();
 	local_irq_restore(flags);
 }
 #else

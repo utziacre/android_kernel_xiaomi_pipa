@@ -197,8 +197,8 @@ bad_bmap:
 
 /*
  * Write a swapcache page out after it has been handed to kcompressd.  The
- * page is still locked here; either frontswap or __swap_writepage() finishes
- * the writeback and unlocks it.
+ * Queueing starts writeback and releases the page lock. Do not wait to lock
+ * it here: swapoff and reclaim can hold the lock while waiting for writeback.
  */
 static void kcompressd_swapout(struct page *page)
 {
@@ -209,15 +209,27 @@ static void kcompressd_swapout(struct page *page)
 		.range_end = LLONG_MAX,
 		.for_reclaim = 1,
 	};
+	bool reclaim;
+
+	if (!trylock_page(page)) {
+		set_page_dirty(page);
+		ClearPageReclaim(page);
+		end_page_writeback(page);
+		goto out;
+	}
 
 	if (frontswap_store(page) == 0) {
-		set_page_writeback(page);
 		unlock_page(page);
 		end_page_writeback(page);
 	} else {
+		/* Hand off to the existing I/O helpers under the page lock. */
+		reclaim = PageReclaim(page);
+		end_page_writeback(page);
+		if (reclaim)
+			SetPageReclaim(page);
 		__swap_writepage(page, &wbc, end_swap_bio_write);
 	}
-
+out:
 	put_page(page);
 }
 
@@ -246,17 +258,19 @@ static bool kcompressd_dequeue(pg_data_t *pgdat, struct page **page)
 
 /*
  * Hand an anonymous page selected by kswapd to kcompressd.  Returning true
- * means the caller must leave the page locked; kcompressd will unlock it
- * after the compression/writeback completes.
+ * means writeback has started and the page has been unlocked. The queue's
+ * reference and PG_writeback keep the page and swap entry alive until service.
  */
-static bool kcompressd_store(struct page *page)
+static bool kcompressd_store(struct page *page, struct writeback_control *wbc)
 {
 	struct swap_info_struct *sis = page_swap_info(page);
 	pg_data_t *pgdat;
 	unsigned long flags;
 	unsigned int next;
 
-	if (!current_is_kswapd() || PageTransHuge(page) || !PageAnon(page))
+	if (!current_is_kswapd() || !wbc->for_reclaim ||
+	    wbc->sync_mode != WB_SYNC_NONE ||
+	    PageTransHuge(page) || !PageAnon(page))
 		return false;
 
 	if (!(sis->flags & SWP_SYNCHRONOUS_IO))
@@ -274,6 +288,8 @@ static bool kcompressd_store(struct page *page)
 	}
 
 	get_page(page);
+	set_page_writeback(page);
+	unlock_page(page);
 	pgdat->kcompress_queue[pgdat->kcompress_head] = page;
 	smp_wmb();
 	pgdat->kcompress_head = next;
@@ -288,7 +304,7 @@ int kcompressd(void *p)
 	pg_data_t *pgdat = p;
 	struct page *page;
 
-	current->flags |= PF_MEMALLOC | PF_KSWAPD;
+	current->flags |= PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD;
 	set_freezable();
 
 	while (!kthread_should_stop()) {
@@ -322,7 +338,7 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		unlock_page(page);
 		goto out;
 	}
-	if (kcompressd_store(page))
+	if (kcompressd_store(page, wbc))
 		return 0;
 	if (frontswap_store(page) == 0) {
 		set_page_writeback(page);

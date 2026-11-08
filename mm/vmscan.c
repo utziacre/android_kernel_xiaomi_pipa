@@ -6987,6 +6987,7 @@ int kswapd_run(int nid)
 	if (pgdat->kswapd)
 		return 0;
 
+#ifdef CONFIG_SWAP
 	spin_lock_init(&pgdat->kcompress_lock);
 	init_waitqueue_head(&pgdat->kcompress_wait);
 	pgdat->kcompress_head = 0;
@@ -7002,6 +7003,8 @@ int kswapd_run(int nid)
 		return ret;
 	}
 
+#endif
+
 	pgdat->kshrinkd = kthread_run(kshrinkd, pgdat, "kshrinkd%d", nid);
 	if (IS_ERR(pgdat->kshrinkd)) {
 		/* failure at boot is fatal */
@@ -7009,7 +7012,8 @@ int kswapd_run(int nid)
 		pr_err("Failed to start kshrinkd on node %d\n", nid);
 		ret = PTR_ERR(pgdat->kshrinkd);
 		pgdat->kshrinkd = NULL;
-		kthread_stop(pgdat->kcompressd);
+		if (pgdat->kcompressd)
+			kthread_stop(pgdat->kcompressd);
 		pgdat->kcompressd = NULL;
 		return ret;
 	}
@@ -7023,7 +7027,8 @@ int kswapd_run(int nid)
 		pgdat->kswapd = NULL;
 		kthread_stop(pgdat->kshrinkd);
 		pgdat->kshrinkd = NULL;
-		kthread_stop(pgdat->kcompressd);
+		if (pgdat->kcompressd)
+			kthread_stop(pgdat->kcompressd);
 		pgdat->kcompressd = NULL;
 	}
 	return ret;

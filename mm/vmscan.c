@@ -4573,8 +4573,9 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
 		if (max_seq - seq > 1)
 			return true;
 
-		/* Over-swapping can increase allocation latency. */
-		if (sc->nr_reclaimed >= sc->nr_to_reclaim && need_swapping)
+		/* Stop order-0 callers once a reclaim batch meets their target. */
+		if (sc->nr_reclaimed >= sc->nr_to_reclaim &&
+		    (need_swapping || !sc->order))
 			return true;
 
 		/* Give this thread a chance to exit and free its memory. */
@@ -5630,12 +5631,12 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 			 * cgroups to fulfill the overall scan target for the
 			 * node.
 			 *
-			 * Limit reclaim, on the other hand, only cares about
-			 * nr_to_reclaim pages to be reclaimed and it will
-			 * retry with decreasing priority if one round over the
-			 * whole hierarchy is not sufficient.
+			 * Limit reclaim and order-0 MGLRU direct reclaim can
+			 * return once their target is met. The shared iterator
+			 * retains their position for the next reclaim attempt.
 			 */
-			if (!global_reclaim(sc) &&
+			if ((!global_reclaim(sc) ||
+			     (lru_gen_enabled() && !current_is_kswapd() && !sc->order)) &&
 					sc->nr_reclaimed >= sc->nr_to_reclaim) {
 				mem_cgroup_iter_break(root, memcg);
 				break;

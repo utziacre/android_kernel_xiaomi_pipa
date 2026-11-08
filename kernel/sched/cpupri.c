@@ -131,6 +131,7 @@ retry:
 			int cpu;
 
 			cpumask_and(lowest_mask, p->cpus_ptr, vec->mask);
+			cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
 			cpumask_andnot(lowest_mask, lowest_mask,
 				       cpu_isolated_mask);
 			if (drop_nopreempts)

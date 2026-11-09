@@ -172,18 +172,19 @@ static struct workqueue_struct *memlat_wq;
  * do not use perf_event_read_value() here: it may send a synchronous IPI
  * when the event belongs to another CPU.
  */
-static void read_event(struct event_data *event)
+static bool read_event(struct event_data *event)
 {
 	u64 total;
 
 	if (!event->pevent)
-		return;
+		return false;
 
 	if (perf_event_read_local(event->pevent, &total, NULL, NULL))
-		return;
+		return false;
 
 	event->last_delta = total - event->prev_count;
 	event->prev_count = total;
+	return true;
 }
 
 /*
@@ -198,8 +199,14 @@ static void read_cpu_events(struct memlat_cpu_grp *cpu_grp, unsigned int cpu)
 	struct memlat_mon *mon;
 	unsigned int i;
 
-	for (i = 0; i < NUM_COMMON_EVS; i++)
-		read_event(&common_evs[i]);
+	/* Keep the previous snapshot if cycles are unavailable. */
+	if (!read_event(&common_evs[CYC_IDX]))
+		return;
+
+	for (i = 0; i < NUM_COMMON_EVS; i++) {
+		if (i != CYC_IDX)
+			read_event(&common_evs[i]);
+	}
 
 	if (!common_evs[STALL_IDX].pevent)
 		common_evs[STALL_IDX].last_delta =
@@ -340,7 +347,8 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 			devstats->mem_count = 1;
 		}
 
-		if (mon->access_ev_id && mon->wb_ev_id)
+		if (mon->access_ev_id && mon->wb_ev_id &&
+		    mon->access_ev[mon_idx].last_delta)
 			devstats->wb_pct =
 				mult_frac(100, mon->wb_ev[mon_idx].last_delta,
 					  mon->access_ev[mon_idx].last_delta);

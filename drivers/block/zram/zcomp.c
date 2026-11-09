@@ -720,9 +720,14 @@ int zcomp_decompress(struct zcomp_strm *zstrm,
 		const void *src, unsigned int src_len, void *dst)
 {
 	unsigned int dst_len = PAGE_SIZE;
+	int ret;
 
-	return zstrm->ops->decompress(zstrm->ctx, src, src_len,
-				      dst, &dst_len);
+	ret = zstrm->ops->decompress(zstrm->ctx, src, src_len, dst, &dst_len);
+	if (ret)
+		return ret;
+
+	/* A successfully decoded swap slot must initialize the entire page. */
+	return dst_len == PAGE_SIZE ? 0 : -EIO;
 }
 
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)

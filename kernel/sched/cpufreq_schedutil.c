@@ -130,6 +130,8 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 
 		return true;
 	}
+	if (sg_policy->need_freq_update)
+		return true;
 
 	/* No need to recalculate next freq for min_rate_limit_us
 	 * at least. However we might still decide to further rate
@@ -180,13 +182,18 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 				   unsigned int next_freq)
 {
-	if (sg_policy->next_freq == next_freq)
-		return false;
+	if (sg_policy->need_freq_update) {
+		/* Policy limits and deadline bandwidth must take effect now. */
+		sg_policy->need_freq_update = false;
+	} else {
+		if (sg_policy->next_freq == next_freq)
+			return false;
 
-	if (sugov_up_down_rate_limit(sg_policy, time, next_freq)) {
-		/* Restore cached freq as next_freq is not changed */
-		sg_policy->cached_raw_freq = sg_policy->prev_cached_raw_freq;
-		return false;
+		if (sugov_up_down_rate_limit(sg_policy, time, next_freq)) {
+			/* Restore cached freq as next_freq is not changed */
+			sg_policy->cached_raw_freq = sg_policy->prev_cached_raw_freq;
+			return false;
+		}
 	}
 
 	sg_policy->next_freq = next_freq;
@@ -262,8 +269,10 @@ static void sugov_fast_switch(struct sugov_policy *sg_policy, u64 time,
 
 	sugov_track_cycles(sg_policy, sg_policy->policy->cur, time);
 	next_freq = cpufreq_driver_fast_switch(policy, next_freq);
-	if (!next_freq)
+	if (!next_freq) {
+		sg_policy->need_freq_update = true;
 		return;
+	}
 
 	policy->cur = next_freq;
 
@@ -367,7 +376,6 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
 
-	sg_policy->need_freq_update = false;
 	sg_policy->prev_cached_raw_freq = sg_policy->cached_raw_freq;
 	sg_policy->cached_raw_freq = freq;
 	l_freq = cpufreq_driver_resolve_freq(policy, freq);
@@ -749,10 +757,12 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	sugov_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
 
+	/* Serialize with the immediate fast-switch path in sugov_limits(). */
+	raw_spin_lock(&sg_policy->update_lock);
 	ignore_dl_rate_limit(sg_cpu, sg_policy);
 
 	if (!sugov_should_update_freq(sg_policy, time))
-		return;
+		goto unlock;
 
 	/* Limits may have changed, don't skip frequency update */
 	busy = use_pelt() && !sg_policy->need_freq_update &&
@@ -795,18 +805,13 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 		sg_policy->cached_raw_freq = sg_policy->prev_cached_raw_freq;
 	}
 
-	/*
-	 * This code runs under rq->lock for the target CPU, so it won't run
-	 * concurrently on two different CPUs for the same target and it is not
-	 * necessary to acquire the lock in the fast switch case.
-	 */
-	if (sg_policy->policy->fast_switch_enabled) {
+	if (sg_policy->policy->fast_switch_enabled)
 		sugov_fast_switch(sg_policy, time, next_f);
-	} else {
-		raw_spin_lock(&sg_policy->update_lock);
+	else
 		sugov_deferred_update(sg_policy, time, next_f);
-		raw_spin_unlock(&sg_policy->update_lock);
-	}
+
+unlock:
+	raw_spin_unlock(&sg_policy->update_lock);
 }
 
 static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
@@ -1494,6 +1499,7 @@ static void sugov_limits(struct cpufreq_policy *policy)
 		 */
 		freq = cpufreq_driver_resolve_freq(policy, freq);
 		sg_policy->cached_raw_freq = freq;
+		sg_policy->need_freq_update = true;
 		sugov_fast_switch(sg_policy, now, freq);
 		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 	}

@@ -52,12 +52,15 @@ struct event_data {
 	struct perf_event *pevent;
 	unsigned long prev_count;
 	unsigned long last_delta;
+	unsigned long next_count;
 };
 
 struct cpu_data {
 	struct event_data common_evs[NUM_COMMON_EVS];
 	unsigned long freq;
 	unsigned long stall_pct;
+	bool needs_rebase;
+	bool sample_ready;
 };
 
 /**
@@ -115,10 +118,7 @@ struct memlat_mon {
  * @cpus_data:			The cpus data array of length #cpus. Includes
  *				event_data of all the events all mons need as
  *				well as common computed cpu data like freq.
- * @last_update_ts:		Used to avoid redundant reads.
- * @last_ts_delta_us:		The time difference between the most recent
- *				update and the one before that. Used to compute
- *				effective frequency.
+ * @last_update_ts:		Start of the previous sampling round.
  * @work:			The delayed_work used for handling updates.
  * @update_ms:			The frequency with which @work triggers.
  * @num_mons:		The number of @mons for this cpu_grp.
@@ -134,7 +134,6 @@ struct memlat_cpu_grp {
 	unsigned int		common_ev_ids[NUM_COMMON_EVS];
 	struct cpu_data		*cpus_data;
 	ktime_t			last_update_ts;
-	unsigned long		last_ts_delta_us;
 
 	struct delayed_work	work;
 	unsigned int		update_ms;
@@ -182,9 +181,17 @@ static bool read_event(struct event_data *event)
 	if (perf_event_read_local(event->pevent, &total, NULL, NULL))
 		return false;
 
-	event->last_delta = total - event->prev_count;
-	event->prev_count = total;
+	event->next_count = total;
 	return true;
+}
+
+static void commit_event(struct event_data *event, bool rebase)
+{
+	if (!event->pevent)
+		return;
+	if (!rebase)
+		event->last_delta = event->next_count - event->prev_count;
+	event->prev_count = event->next_count;
 }
 
 /*
@@ -199,14 +206,45 @@ static void read_cpu_events(struct memlat_cpu_grp *cpu_grp, unsigned int cpu)
 	struct memlat_mon *mon;
 	unsigned int i;
 
-	/* Keep the previous snapshot if cycles are unavailable. */
+	/* Do not advance any baselines until the entire CPU sample is valid. */
 	if (!read_event(&common_evs[CYC_IDX]))
 		return;
 
 	for (i = 0; i < NUM_COMMON_EVS; i++) {
-		if (i != CYC_IDX)
-			read_event(&common_evs[i]);
+		if (i != CYC_IDX && common_evs[i].pevent &&
+		    !read_event(&common_evs[i]))
+			return;
 	}
+
+	for (i = 0; i < cpu_grp->num_mons; i++) {
+		unsigned int mon_idx;
+
+		mon = &cpu_grp->mons[i];
+		if (!mon->is_active || !mon->miss_ev ||
+		    !cpumask_test_cpu(cpu, &mon->cpus))
+			continue;
+
+		mon_idx = cpu - cpumask_first(&mon->cpus);
+		if (!read_event(&mon->miss_ev[mon_idx]))
+			return;
+
+		if (mon->wb_ev_id && mon->access_ev_id &&
+		    (!read_event(&mon->wb_ev[mon_idx]) ||
+		     !read_event(&mon->access_ev[mon_idx])))
+			return;
+	}
+	cpu_data->sample_ready = true;
+}
+
+static void commit_cpu_events(struct memlat_cpu_grp *cpu_grp, unsigned int cpu)
+{
+	struct cpu_data *cpu_data = to_cpu_data(cpu_grp, cpu);
+	struct event_data *common_evs = cpu_data->common_evs;
+	struct memlat_mon *mon;
+	unsigned int i;
+
+	for (i = 0; i < NUM_COMMON_EVS; i++)
+		commit_event(&common_evs[i], cpu_data->needs_rebase);
 
 	if (!common_evs[STALL_IDX].pevent)
 		common_evs[STALL_IDX].last_delta =
@@ -221,11 +259,10 @@ static void read_cpu_events(struct memlat_cpu_grp *cpu_grp, unsigned int cpu)
 			continue;
 
 		mon_idx = cpu - cpumask_first(&mon->cpus);
-		read_event(&mon->miss_ev[mon_idx]);
-
+		commit_event(&mon->miss_ev[mon_idx], cpu_data->needs_rebase);
 		if (mon->wb_ev_id && mon->access_ev_id) {
-			read_event(&mon->wb_ev[mon_idx]);
-			read_event(&mon->access_ev[mon_idx]);
+			commit_event(&mon->wb_ev[mon_idx], cpu_data->needs_rebase);
+			commit_event(&mon->access_ev[mon_idx], cpu_data->needs_rebase);
 		}
 	}
 }
@@ -246,12 +283,11 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 	struct cpu_data *cpu_data;
 	struct event_data *common_evs;
 	ktime_t now = ktime_get();
-	unsigned long delta;
+	u64 delta;
 	unsigned int cpu;
 	int this_cpu;
 
 	delta = ktime_us_delta(now, cpu_grp->last_update_ts);
-	cpu_grp->last_ts_delta_us = delta;
 	cpu_grp->last_update_ts = now;
 
 	cpumask_clear(&read_mask);
@@ -265,8 +301,12 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 	this_cpu = raw_smp_processor_id();
 
 	for_each_cpu(cpu, &cpu_grp->cpus) {
-		if (!cpu_online(cpu) || under_scm_call(cpu))
+		cpu_data = to_cpu_data(cpu_grp, cpu);
+		cpu_data->sample_ready = false;
+		if (!cpu_online(cpu) || under_scm_call(cpu)) {
+			cpu_data->needs_rebase = true;
 			continue;
+		}
 
 		if (cpu == this_cpu) {
 			cpumask_set_cpu(cpu, &read_mask);
@@ -279,8 +319,10 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 		csd[cpu].flags = 0;
 
 		if (generic_exec_single(cpu, &csd[cpu],
-					read_cpu_events_ipi, &ipi_data[cpu]))
+					read_cpu_events_ipi, &ipi_data[cpu])) {
+			cpu_data->needs_rebase = true;
 			continue;
+		}
 
 		cpumask_set_cpu(cpu, &read_mask);
 	}
@@ -307,26 +349,34 @@ static void update_counts(struct memlat_cpu_grp *cpu_grp)
 		cpu_data = to_cpu_data(cpu_grp, cpu);
 		common_evs = cpu_data->common_evs;
 
+		if (!cpu_data->sample_ready) {
+			cpu_data->needs_rebase = true;
+			continue;
+		}
+		/* Baseline updates and arithmetic stay out of the IPI callback. */
+		commit_cpu_events(cpu_grp, cpu);
+		if (cpu_data->needs_rebase) {
+			/* Publish only after one complete interval at the new baseline. */
+			cpu_data->needs_rebase = false;
+			cpu_data->sample_ready = false;
+			continue;
+		}
+
 		cpu_data->freq = delta ?
-			common_evs[CYC_IDX].last_delta / delta : 0;
+			div64_u64(common_evs[CYC_IDX].last_delta, delta) : 0;
 		cpu_data->stall_pct = common_evs[CYC_IDX].last_delta ?
 			mult_frac(100, common_evs[STALL_IDX].last_delta,
 				  common_evs[CYC_IDX].last_delta) : 0;
 	}
 }
 
-static unsigned long get_cnt(struct memlat_hwmon *hw)
+static void update_dev_stats(struct memlat_mon *mon)
 {
-	struct memlat_mon *mon = to_mon(hw);
 	struct memlat_cpu_grp *cpu_grp = mon->cpu_grp;
 	unsigned int cpu;
 
-	/*
-	 * Some of SCM call is very heavy(+20ms) so perf IPI could
-	 * be stuck on the CPU which contributes long latency.
-	 */
-	if (under_scm_call(raw_smp_processor_id()))
-		return 0;
+	lockdep_assert_held(&cpu_grp->mons_lock);
+	lockdep_assert_held(&mon->hw.df->lock);
 
 	for_each_cpu(cpu, &mon->cpus) {
 		struct cpu_data *cpu_data = to_cpu_data(cpu_grp, cpu);
@@ -334,6 +384,9 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 		unsigned int mon_idx =
 			cpu - cpumask_first(&mon->cpus);
 		struct dev_stats *devstats = to_devstats(mon, cpu);
+
+		if (!cpu_data->sample_ready)
+			continue;
 
 		devstats->freq = cpu_data->freq;
 		devstats->stall_pct = cpu_data->stall_pct;
@@ -355,13 +408,19 @@ static unsigned long get_cnt(struct memlat_hwmon *hw)
 		else
 			devstats->wb_pct = 0;
 	}
+}
 
+static unsigned long get_cnt(struct memlat_hwmon *hw)
+{
+	/* The sampling worker publishes complete statistics under df->lock. */
 	return 0;
 }
 
 static void delete_event(struct event_data *event)
 {
-	event->prev_count = event->last_delta = 0;
+	event->prev_count = 0;
+	event->last_delta = 0;
+	event->next_count = 0;
 	if (event->pevent) {
 		perf_event_release_kernel(event->pevent);
 		event->pevent = NULL;
@@ -412,6 +471,9 @@ static int init_common_evs(struct memlat_cpu_grp *cpu_grp,
 	for_each_cpu(cpu, &cpu_grp->cpus) {
 		struct event_data *common_evs = to_common_evs(cpu_grp, cpu);
 
+		to_cpu_data(cpu_grp, cpu)->needs_rebase = true;
+		to_cpu_data(cpu_grp, cpu)->sample_ready = false;
+
 		for (i = 0; i < NUM_COMMON_EVS; i++) {
 			ret = set_event(&common_evs[i], cpu,
 					cpu_grp->common_ev_ids[i], attr);
@@ -457,6 +519,7 @@ static void memlat_monitor_work(struct work_struct *work)
 
 		df = mon->hw.df;
 		mutex_lock(&df->lock);
+		update_dev_stats(mon);
 		err = update_devfreq(df);
 		if (err)
 			dev_err(mon->hw.dev, "Memlat update failed: %d\n", err);

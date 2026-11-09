@@ -1688,11 +1688,36 @@ bool kgsl_sharedmem_get_noretry(void)
 	return sharedmem_noretry_flag;
 }
 
+#define KGSL_ZERO_BATCH_PAGES 32U
+
 void kgsl_zero_page(struct page *p, unsigned int order)
 {
-	int i;
+	unsigned int i;
+	unsigned int nr_pages = 1U << order;
 
-	for (i = 0; i < (1 << order); i++) {
+	/*
+	 * A lowmem allocation is contiguous in the linear mapping.  Clear it
+	 * a bounded chunk at a time, sharing the cache-maintenance completion
+	 * barrier across pages instead of mapping and flushing each separately.
+	 * Keep the atomic mapping path for highmem allocations.
+	 */
+	if (!PageHighMem(p)) {
+		void *addr = page_address(p);
+
+		for (i = 0; i < nr_pages; i += KGSL_ZERO_BATCH_PAGES) {
+			unsigned int count = min(nr_pages - i,
+						 KGSL_ZERO_BATCH_PAGES);
+			void *start = addr + i * PAGE_SIZE;
+			unsigned int j;
+
+			for (j = 0; j < count; j++)
+				clear_page(start + j * PAGE_SIZE);
+			dmac_flush_range(start, start + count * PAGE_SIZE);
+		}
+		return;
+	}
+
+	for (i = 0; i < nr_pages; i++) {
 		struct page *page = nth_page(p, i);
 		void *addr = kmap_atomic(page);
 

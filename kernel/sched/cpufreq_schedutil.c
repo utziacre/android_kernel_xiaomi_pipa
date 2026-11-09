@@ -349,9 +349,8 @@ static unsigned long sugov_map_util_freq(unsigned long util,
  * The margin is applied by sugov_map_util_freq(), which tapers it down at the
  * top of the frequency range, see the comment above it.
  *
- * The lowest driver-supported frequency which is equal or greater than the raw
- * next_freq (as calculated above) is returned, subject to policy min/max and
- * cpufreq driver limitations.
+ * Resolve the raw frequency against the policy limits and driver-supported
+ * frequencies, preferring the lower step when the raw value is close to it.
  */
 static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 				  unsigned long util, unsigned long max)
@@ -359,7 +358,8 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
 				policy->cpuinfo.max_freq : policy->cur;
-	unsigned int idx, l_freq, h_freq;
+	unsigned int l_freq, h_freq;
+	int idx;
 
 	freq = sugov_map_util_freq(util, freq, max);
 	trace_sugov_next_freq(policy->cpu, util, max, freq);
@@ -371,7 +371,13 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	sg_policy->prev_cached_raw_freq = sg_policy->cached_raw_freq;
 	sg_policy->cached_raw_freq = freq;
 	l_freq = cpufreq_driver_resolve_freq(policy, freq);
+	if (!policy->freq_table)
+		return l_freq;
+
 	idx = cpufreq_frequency_table_target(policy, freq, CPUFREQ_RELATION_H);
+	if (idx < 0)
+		return l_freq;
+
 	h_freq = policy->freq_table[idx].frequency;
 	h_freq = clamp(h_freq, policy->min, policy->max);
 	if (l_freq <= h_freq || l_freq == policy->min)
@@ -382,7 +388,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	 * higher than it.
 	 */
 	if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 20)
-		return h_freq;
+		return cpufreq_driver_resolve_freq(policy, h_freq);
 
 	return l_freq;
 }

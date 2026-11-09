@@ -22,6 +22,7 @@
 #include <cdp_txrx_cmn_struct.h>
 #include <cdp_txrx_peer_ops.h>
 #include <cds_sched.h>
+#include <linux/atomic.h>
 
 /* Timeout in ms to wait for a DP rx thread */
 #define DP_RX_THREAD_WAIT_TIMEOUT 1000
@@ -475,6 +476,8 @@ static void dp_rx_thread_gro_flush(struct dp_rx_thread *rx_thread)
  */
 static int dp_rx_thread_sub_loop(struct dp_rx_thread *rx_thread, bool *shutdown)
 {
+	bool vdev_del;
+
 	while (true) {
 		if (qdf_atomic_test_and_clear_bit(RX_SHUTDOWN_EVENT,
 						  &rx_thread->event_flag)) {
@@ -495,15 +498,14 @@ static int dp_rx_thread_sub_loop(struct dp_rx_thread *rx_thread, bool *shutdown)
 					&rx_thread->event_flag))
 			continue;
 
-		if (qdf_atomic_read(&rx_thread->gro_flush_ind) |
-		    qdf_atomic_test_bit(RX_VDEV_DEL_EVENT,
-					&rx_thread->event_flag)) {
+		/* Consume first so requests posted during the flush survive. */
+		vdev_del = qdf_atomic_test_and_clear_bit(RX_VDEV_DEL_EVENT,
+							 &rx_thread->event_flag);
+		if ((qdf_atomic_read(&rx_thread->gro_flush_ind) &&
+		     atomic_xchg(&rx_thread->gro_flush_ind, 0)) || vdev_del)
 			dp_rx_thread_gro_flush(rx_thread);
-			qdf_atomic_set(&rx_thread->gro_flush_ind, 0);
-		}
 
-		if (qdf_atomic_test_and_clear_bit(RX_VDEV_DEL_EVENT,
-						  &rx_thread->event_flag)) {
+		if (vdev_del) {
 			rx_thread->stats.gro_flushes_by_vdev_del++;
 			qdf_event_set(&rx_thread->vdev_del_event);
 		}

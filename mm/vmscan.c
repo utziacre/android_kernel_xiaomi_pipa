@@ -6572,7 +6572,8 @@ restart:
 		ret = try_to_freeze();
 		__fs_reclaim_acquire();
 		if (ret || kthread_should_stop() ||
-		    !atomic_long_read(&kswapd_waiters))
+		    (!atomic_long_read(&kswapd_waiters) &&
+		     pgdat_balanced(pgdat, 0, classzone_idx)))
 			break;
 
 		/*
@@ -6598,6 +6599,9 @@ restart:
 		count_vm_event(LRU_KSWAPD_NO_PROGRESS);
 		if (!lru_gen_enabled())
 			pgdat->kswapd_failures++;
+		else
+			/* Let writeback and compression run before another pass. */
+			schedule_timeout_idle(1);
 	}
 
 out:

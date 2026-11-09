@@ -699,8 +699,10 @@ cds_indicate_rxpkt(p_cds_sched_context pSchedContext,
 	spin_lock_bh(&pSchedContext->ol_rx_queue_lock);
 	list_add_tail(&pkt->list, &pSchedContext->ol_rx_thread_queue);
 	spin_unlock_bh(&pSchedContext->ol_rx_queue_lock);
-	set_bit(RX_POST_EVENT, &pSchedContext->ol_rx_event_flag);
-	wake_up_interruptible(&pSchedContext->ol_rx_wait_queue);
+	/* One pending event already covers subsequent queue additions. */
+	if (!test_and_set_bit(RX_POST_EVENT,
+			      &pSchedContext->ol_rx_event_flag))
+		wake_up_interruptible(&pSchedContext->ol_rx_wait_queue);
 }
 
 /**

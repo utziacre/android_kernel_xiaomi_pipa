@@ -313,8 +313,9 @@ enq_done:
 		 rx_thread, wait_q_ptr,
 		 qdf_nbuf_queue_head_qlen(&rx_thread->nbuf_queue));
 
-	qdf_set_bit(RX_POST_EVENT, &rx_thread->event_flag);
-	qdf_wake_up_interruptible(wait_q_ptr);
+	/* One pending event already covers subsequent queue additions. */
+	if (!qdf_atomic_test_and_set_bit(RX_POST_EVENT, &rx_thread->event_flag))
+		qdf_wake_up_interruptible(wait_q_ptr);
 
 	return QDF_STATUS_SUCCESS;
 }
@@ -331,8 +332,8 @@ static QDF_STATUS dp_rx_tm_thread_gro_flush_ind(struct dp_rx_thread *rx_thread)
 
 	dp_debug("Flush indication received");
 
-	qdf_set_bit(RX_POST_EVENT, &rx_thread->event_flag);
-	qdf_wake_up_interruptible(wait_q_ptr);
+	if (!qdf_atomic_test_and_set_bit(RX_POST_EVENT, &rx_thread->event_flag))
+		qdf_wake_up_interruptible(wait_q_ptr);
 	return QDF_STATUS_SUCCESS;
 }
 

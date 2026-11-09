@@ -423,6 +423,17 @@ static int dp_rx_thread_process_nbufq(struct dp_rx_thread *rx_thread)
 			rx_thread->stats.nbuf_sent_to_stack +=
 							num_list_elements;
 		}
+		/* Continuous arrivals must not starve control completions. */
+		if (qdf_atomic_test_bit(RX_SHUTDOWN_EVENT,
+					&rx_thread->event_flag) ||
+		    qdf_atomic_test_bit(RX_SUSPEND_EVENT,
+					&rx_thread->event_flag) ||
+		    qdf_atomic_test_bit(RX_VDEV_DEL_EVENT,
+					&rx_thread->event_flag)) {
+			/* Revisit the shared queue after handling the event. */
+			qdf_set_bit(RX_POST_EVENT, &rx_thread->event_flag);
+			break;
+		}
 		nbuf_list = dp_rx_tm_thread_dequeue(rx_thread);
 	}
 
@@ -478,6 +489,10 @@ static int dp_rx_thread_sub_loop(struct dp_rx_thread *rx_thread, bool *shutdown)
 		}
 
 		dp_rx_thread_process_nbufq(rx_thread);
+
+		if (qdf_atomic_test_bit(RX_SHUTDOWN_EVENT,
+					&rx_thread->event_flag))
+			continue;
 
 		if (qdf_atomic_read(&rx_thread->gro_flush_ind) |
 		    qdf_atomic_test_bit(RX_VDEV_DEL_EVENT,

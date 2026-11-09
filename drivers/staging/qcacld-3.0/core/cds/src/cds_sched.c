@@ -792,6 +792,15 @@ static void cds_rx_from_queue(p_cds_sched_context pSchedContext)
 
 	spin_lock_bh(&pSchedContext->ol_rx_queue_lock);
 	while (!list_empty(&pSchedContext->ol_rx_thread_queue)) {
+		/* Do not make control requests wait for a busy queue to empty. */
+		if (test_bit(RX_SHUTDOWN_EVENT,
+			     &pSchedContext->ol_rx_event_flag) ||
+		    test_bit(RX_SUSPEND_EVENT,
+			     &pSchedContext->ol_rx_event_flag)) {
+			/* Resume must revisit packets left on the shared queue. */
+			set_bit(RX_POST_EVENT, &pSchedContext->ol_rx_event_flag);
+			break;
+		}
 		pkt = list_first_entry(&pSchedContext->ol_rx_thread_queue,
 				       struct cds_ol_rx_pkt, list);
 		list_del(&pkt->list);
@@ -864,6 +873,10 @@ static int cds_ol_rx_thread(void *arg)
 				break;
 			}
 			cds_rx_from_queue(pSchedContext);
+
+			if (test_bit(RX_SHUTDOWN_EVENT,
+				     &pSchedContext->ol_rx_event_flag))
+				continue;
 
 			if (test_bit(RX_SUSPEND_EVENT,
 				     &pSchedContext->ol_rx_event_flag)) {

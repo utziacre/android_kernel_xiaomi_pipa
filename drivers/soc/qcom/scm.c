@@ -11,6 +11,7 @@
 #include <linux/err.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/preempt.h>
 
 #include <asm/cacheflush.h>
 #include <asm/compiler.h>
@@ -93,202 +94,201 @@ static int scm_remap_error(int err)
 	return -EINVAL;
 }
 
+/* Preserve all seven registers across interrupted firmware entries. */
+struct scm_registers {
+	u64 r[7];
+};
+
 #ifdef CONFIG_ARM64
 
-static int ___scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
+static void scm_smc64(struct scm_registers *regs)
 {
-	register u64 r0 asm("x0") = x0;
-	register u64 r1 asm("x1") = x1;
-	register u64 r2 asm("x2") = x2;
-	register u64 r3 asm("x3") = x3;
-	register u64 r4 asm("x4") = x4;
-	register u64 r5 asm("x5") = x5;
-	register u64 r6 asm("x6") = 0;
+	register u64 r0 asm("x0") = regs->r[0];
+	register u64 r1 asm("x1") = regs->r[1];
+	register u64 r2 asm("x2") = regs->r[2];
+	register u64 r3 asm("x3") = regs->r[3];
+	register u64 r4 asm("x4") = regs->r[4];
+	register u64 r5 asm("x5") = regs->r[5];
+	register u64 r6 asm("x6") = regs->r[6];
 
-	do {
-		asm volatile(
-			__asmeq("%0", R0_STR)
-			__asmeq("%1", R1_STR)
-			__asmeq("%2", R2_STR)
-			__asmeq("%3", R3_STR)
-			__asmeq("%4", R4_STR)
-			__asmeq("%5", R5_STR)
-			__asmeq("%6", R6_STR)
-			__asmeq("%7", R0_STR)
-			__asmeq("%8", R1_STR)
-			__asmeq("%9", R2_STR)
-			__asmeq("%10", R3_STR)
-			__asmeq("%11", R4_STR)
-			__asmeq("%12", R5_STR)
-			__asmeq("%13", R6_STR)
+	asm volatile(__asmeq("%0", R0_STR)
+		__asmeq("%1", R1_STR)
+		__asmeq("%2", R2_STR)
+		__asmeq("%3", R3_STR)
+		__asmeq("%4", R4_STR)
+		__asmeq("%5", R5_STR)
+		__asmeq("%6", R6_STR)
+		__asmeq("%7", R0_STR)
+		__asmeq("%8", R1_STR)
+		__asmeq("%9", R2_STR)
+		__asmeq("%10", R3_STR)
+		__asmeq("%11", R4_STR)
+		__asmeq("%12", R5_STR)
+		__asmeq("%13", R6_STR)
 #ifdef REQUIRES_SEC
-			".arch_extension sec\n"
+		".arch_extension sec\n"
 #endif
-			"smc	#0\n"
-			: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
-			  "=r" (r4), "=r" (r5), "=r" (r6)
-			: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
-			  "r" (r5), "r" (r6)
-			: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-			  "x14", "x15", "x16", "x17");
-	} while (r0 == SCM_INTERRUPTED);
+		"smc	#0\n"
+		: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
+		  "=r" (r4), "=r" (r5), "=r" (r6)
+		: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
+		  "r" (r5), "r" (r6)
+		: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+		  "x14", "x15", "x16", "x17", "memory");
 
-	if (ret1)
-		*ret1 = r1;
-	if (ret2)
-		*ret2 = r2;
-	if (ret3)
-		*ret3 = r3;
-
-	return r0;
+	regs->r[0] = r0;
+	regs->r[1] = r1;
+	regs->r[2] = r2;
+	regs->r[3] = r3;
+	regs->r[4] = r4;
+	regs->r[5] = r5;
+	regs->r[6] = r6;
 }
 
-static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
+static void scm_smc32(struct scm_registers *regs)
 {
-	atomic_t *cnt = per_cpu_ptr(&scm_call_count, raw_smp_processor_id());
-	int ret;
+	register u32 r0 asm("w0") = regs->r[0];
+	register u32 r1 asm("w1") = regs->r[1];
+	register u32 r2 asm("w2") = regs->r[2];
+	register u32 r3 asm("w3") = regs->r[3];
+	register u32 r4 asm("w4") = regs->r[4];
+	register u32 r5 asm("w5") = regs->r[5];
+	register u32 r6 asm("w6") = regs->r[6];
 
-	atomic_inc(cnt);
-	ret = ___scm_call_armv8_64(x0, x1, x2, x3, x4, x5, ret1, ret2, ret3);
-	atomic_dec(cnt);
-
-	return ret;
-}
-
-static int ___scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
-{
-	register u32 r0 asm("w0") = w0;
-	register u32 r1 asm("w1") = w1;
-	register u32 r2 asm("w2") = w2;
-	register u32 r3 asm("w3") = w3;
-	register u32 r4 asm("w4") = w4;
-	register u32 r5 asm("w5") = w5;
-	register u32 r6 asm("w6") = 0;
-
-	do {
-		asm volatile(
-			__asmeq("%0", R0_STR)
-			__asmeq("%1", R1_STR)
-			__asmeq("%2", R2_STR)
-			__asmeq("%3", R3_STR)
-			__asmeq("%4", R4_STR)
-			__asmeq("%5", R5_STR)
-			__asmeq("%6", R6_STR)
-			__asmeq("%7", R0_STR)
-			__asmeq("%8", R1_STR)
-			__asmeq("%9", R2_STR)
-			__asmeq("%10", R3_STR)
-			__asmeq("%11", R4_STR)
-			__asmeq("%12", R5_STR)
-			__asmeq("%13", R6_STR)
+	asm volatile(__asmeq("%0", R0_STR)
+		__asmeq("%1", R1_STR)
+		__asmeq("%2", R2_STR)
+		__asmeq("%3", R3_STR)
+		__asmeq("%4", R4_STR)
+		__asmeq("%5", R5_STR)
+		__asmeq("%6", R6_STR)
+		__asmeq("%7", R0_STR)
+		__asmeq("%8", R1_STR)
+		__asmeq("%9", R2_STR)
+		__asmeq("%10", R3_STR)
+		__asmeq("%11", R4_STR)
+		__asmeq("%12", R5_STR)
+		__asmeq("%13", R6_STR)
 #ifdef REQUIRES_SEC
-			".arch_extension sec\n"
+		".arch_extension sec\n"
 #endif
-			"smc	#0\n"
-			: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
-			  "=r" (r4), "=r" (r5), "=r" (r6)
-			: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
-			  "r" (r5), "r" (r6)
-			: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-			"x14", "x15", "x16", "x17");
+		"smc	#0\n"
+		: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
+		  "=r" (r4), "=r" (r5), "=r" (r6)
+		: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
+		  "r" (r5), "r" (r6)
+		: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+		  "x14", "x15", "x16", "x17", "memory");
 
-	} while (r0 == SCM_INTERRUPTED);
-
-	if (ret1)
-		*ret1 = r1;
-	if (ret2)
-		*ret2 = r2;
-	if (ret3)
-		*ret3 = r3;
-
-	return r0;
-}
-
-static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
-{
-	atomic_t *cnt = per_cpu_ptr(&scm_call_count, raw_smp_processor_id());
-	int ret;
-
-	atomic_inc(cnt);
-	ret = ___scm_call_armv8_32(w0, w1, w2, w3, w4, w5, ret1, ret2, ret3);
-	atomic_dec(cnt);
-
-	return ret;
+	regs->r[0] = r0;
+	regs->r[1] = r1;
+	regs->r[2] = r2;
+	regs->r[3] = r3;
+	regs->r[4] = r4;
+	regs->r[5] = r5;
+	regs->r[6] = r6;
 }
 
 #else
 
-static int ___scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
+static void scm_smc32(struct scm_registers *regs)
 {
-	register u32 r0 asm("r0") = w0;
-	register u32 r1 asm("r1") = w1;
-	register u32 r2 asm("r2") = w2;
-	register u32 r3 asm("r3") = w3;
-	register u32 r4 asm("r4") = w4;
-	register u32 r5 asm("r5") = w5;
-	register u32 r6 asm("r6") = 0;
+	register u32 r0 asm("r0") = regs->r[0];
+	register u32 r1 asm("r1") = regs->r[1];
+	register u32 r2 asm("r2") = regs->r[2];
+	register u32 r3 asm("r3") = regs->r[3];
+	register u32 r4 asm("r4") = regs->r[4];
+	register u32 r5 asm("r5") = regs->r[5];
+	register u32 r6 asm("r6") = regs->r[6];
 
-	do {
-		asm volatile(
-			__asmeq("%0", R0_STR)
-			__asmeq("%1", R1_STR)
-			__asmeq("%2", R2_STR)
-			__asmeq("%3", R3_STR)
-			__asmeq("%4", R4_STR)
-			__asmeq("%5", R5_STR)
-			__asmeq("%6", R6_STR)
-			__asmeq("%7", R0_STR)
-			__asmeq("%8", R1_STR)
-			__asmeq("%9", R2_STR)
-			__asmeq("%10", R3_STR)
-			__asmeq("%11", R4_STR)
-			__asmeq("%12", R5_STR)
-			__asmeq("%13", R6_STR)
+	asm volatile(__asmeq("%0", R0_STR)
+		__asmeq("%1", R1_STR)
+		__asmeq("%2", R2_STR)
+		__asmeq("%3", R3_STR)
+		__asmeq("%4", R4_STR)
+		__asmeq("%5", R5_STR)
+		__asmeq("%6", R6_STR)
+		__asmeq("%7", R0_STR)
+		__asmeq("%8", R1_STR)
+		__asmeq("%9", R2_STR)
+		__asmeq("%10", R3_STR)
+		__asmeq("%11", R4_STR)
+		__asmeq("%12", R5_STR)
+		__asmeq("%13", R6_STR)
 #ifdef REQUIRES_SEC
-			".arch_extension sec\n"
+		".arch_extension sec\n"
 #endif
-			"smc	#0\n"
-			: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
-			  "=r" (r4), "=r" (r5), "=r" (r6)
-			: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
-			 "r" (r5), "r" (r6));
+		"smc	#0\n"
+		: "=r" (r0), "=r" (r1), "=r" (r2), "=r" (r3),
+		  "=r" (r4), "=r" (r5), "=r" (r6)
+		: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
+		  "r" (r5), "r" (r6)
+		: "memory");
 
-	} while (r0 == SCM_INTERRUPTED);
-
-	if (ret1)
-		*ret1 = r1;
-	if (ret2)
-		*ret2 = r2;
-	if (ret3)
-		*ret3 = r3;
-
-	return r0;
+	regs->r[0] = r0;
+	regs->r[1] = r1;
+	regs->r[2] = r2;
+	regs->r[3] = r3;
+	regs->r[4] = r4;
+	regs->r[5] = r5;
+	regs->r[6] = r6;
 }
 
-static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
+#endif
+
+static int scm_call_registers(struct scm_registers *regs, bool smc64,
+			      u64 *ret1, u64 *ret2, u64 *ret3)
 {
-	atomic_t *cnt = per_cpu_ptr(&scm_call_count, raw_smp_processor_id());
-	int ret;
+	do {
+		atomic_t *cnt;
 
-	atomic_inc(cnt);
-	ret = ___scm_call_armv8_32(w0, w1, w2, w3, w4, w5, ret1, ret2, ret3);
-	atomic_dec(cnt);
+		/*
+		 * Pin only one firmware entry.  Re-enable preemption before
+		 * retrying SCM_INTERRUPTED so pending normal and RT tasks can
+		 * run, and select the busy counter again after any migration.
+		 */
+		preempt_disable();
+		cnt = this_cpu_ptr(&scm_call_count);
+		atomic_inc(cnt);
+#ifdef CONFIG_ARM64
+		if (smc64)
+			scm_smc64(regs);
+		else
+#endif
+			scm_smc32(regs);
+		atomic_dec(cnt);
+		preempt_enable();
+	} while (regs->r[0] == SCM_INTERRUPTED);
 
-	return ret;
+	if (ret1)
+		*ret1 = regs->r[1];
+	if (ret2)
+		*ret2 = regs->r[2];
+	if (ret3)
+		*ret3 = regs->r[3];
+
+	return regs->r[0];
 }
 
 static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
-				u64 *ret1, u64 *ret2, u64 *ret3)
+			       u64 *ret1, u64 *ret2, u64 *ret3)
 {
+#ifdef CONFIG_ARM64
+	struct scm_registers regs = { .r = { x0, x1, x2, x3, x4, x5, 0 } };
+
+	return scm_call_registers(&regs, true, ret1, ret2, ret3);
+#else
 	return 0;
-}
 #endif
+}
+
+static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
+			       u64 *ret1, u64 *ret2, u64 *ret3)
+{
+	struct scm_registers regs = { .r = { w0, w1, w2, w3, w4, w5, 0 } };
+
+	return scm_call_registers(&regs, false, ret1, ret2, ret3);
+}
 
 struct scm_extra_arg {
 	union {

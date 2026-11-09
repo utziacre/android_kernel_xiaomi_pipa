@@ -214,6 +214,9 @@ int ion_heap_buffer_zero(struct ion_buffer *buffer)
 {
 	struct sg_table *table = buffer->sg_table;
 	struct sg_page_iter piter;
+	void *start = NULL;
+	size_t len = 0;
+	unsigned int count = 0;
 
 	/*
 	 * Uncached buffers have to be zeroed through a write-combine mapping:
@@ -235,14 +238,32 @@ int ion_heap_buffer_zero(struct ion_buffer *buffer)
 	 * the cache, and these pages go straight back to the pool; a client
 	 * that maps the recycled page to a non-coherent device would otherwise
 	 * read whatever the previous owner left in DRAM.
+	 *
+	 * Flush adjacent pages together to amortise the completion barrier.
+	 * Bound each batch so a large release also gives other work a chance
+	 * to run on kernels without preemption.
 	 */
 	for_each_sg_page(table->sgl, &piter, table->nents, 0) {
 		struct page *page = sg_page_iter_page(&piter);
 		void *addr = page_address(page);
 
+		if (len && addr != start + len) {
+			__flush_dcache_area(start, len);
+			len = 0;
+		}
+		if (!len)
+			start = addr;
 		clear_page(addr);
-		__flush_dcache_area(addr, PAGE_SIZE);
+		len += PAGE_SIZE;
+		if (++count == ION_HEAP_ZERO_BATCH) {
+			__flush_dcache_area(start, len);
+			len = 0;
+			count = 0;
+			cond_resched();
+		}
 	}
+	if (len)
+		__flush_dcache_area(start, len);
 
 	return 0;
 }

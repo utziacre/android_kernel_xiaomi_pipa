@@ -874,9 +874,11 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 	if (!sg_policy->tunables->pl && flags & SCHED_CPUFREQ_PL)
 		return;
 
+	raw_spin_lock(&sg_policy->update_lock);
+	/* Compare against the previous bandwidth before get_util() updates it. */
+	ignore_dl_rate_limit(sg_cpu, sg_policy);
 	sg_cpu->util = sugov_get_util(sg_cpu);
 	sg_cpu->flags = flags;
-	raw_spin_lock(&sg_policy->update_lock);
 
 	if (sg_policy->max != sg_cpu->max) {
 		sg_policy->max = sg_cpu->max;
@@ -894,7 +896,6 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 
 	sugov_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
 			   sg_policy->policy->cur);
-	ignore_dl_rate_limit(sg_cpu, sg_policy);
 
 	trace_sugov_util_update(sg_cpu->cpu, sg_cpu->util, sg_policy->avg_cap,
 				sg_cpu->max, sg_cpu->walt_load.nl,

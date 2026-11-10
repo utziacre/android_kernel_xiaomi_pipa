@@ -1815,10 +1815,11 @@ static int pick_rt_task(struct rq *rq, struct task_struct *p, int cpu)
 }
 
 /*
- * Return the highest pushable rq's task, which is suitable to be executed
- * on the CPU, NULL otherwise
+ * Return the highest pushable rq's task that can run on @cpu and preempt
+ * @prio, NULL otherwise. Both source and destination rq locks are held.
  */
-static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
+static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu,
+						      int prio)
 {
 	struct plist_head *head = &rq->rt.pushable_tasks;
 	struct task_struct *p;
@@ -1827,6 +1828,10 @@ static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
 		return NULL;
 
 	plist_for_each_entry(p, head, pushable_tasks) {
+		/* Later entries cannot preempt the destination either. */
+		if (p->prio >= prio)
+			break;
+
 		if (pick_rt_task(rq, p, cpu))
 			return p;
 	}
@@ -2445,7 +2450,8 @@ static void pull_rt_task(struct rq *this_rq)
 		 * We can pull only a task, which is pushable
 		 * on its rq, and no others.
 		 */
-		p = pick_highest_pushable_task(src_rq, this_cpu);
+		p = pick_highest_pushable_task(src_rq, this_cpu,
+					       this_rq->rt.highest_prio.curr);
 
 		/*
 		 * Do we have an RT task that preempts

@@ -205,9 +205,10 @@ unsigned int sched_capacity_margin_up[NR_CPUS] = {
 unsigned int sched_capacity_margin_down[NR_CPUS] = {
 			[0 ... NR_CPUS-1] = 1205}; /* ~15% margin */
 
-#ifdef CONFIG_SCHED_WALT
-/* 1ms default for 20ms window size scaled to 1024 */
+/* Utilization floor for uclamp_min placement boosts, scaled to 1024. */
 unsigned int sysctl_sched_min_task_util_for_boost = 51;
+
+#ifdef CONFIG_SCHED_WALT
 /* 0.68ms default for 20ms window size scaled to 1024 */
 unsigned int sysctl_sched_min_task_util_for_colocation = 35;
 __read_mostly unsigned int sysctl_sched_prefer_spread;

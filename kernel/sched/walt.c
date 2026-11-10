@@ -2728,6 +2728,8 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 	struct task_struct *p;
 	u64 combined_demand = 0;
 	bool group_boost = false;
+	bool check_boost = sched_boost_policy() == SCHED_BOOST_ON_BIG;
+	bool trace = trace_sched_set_preferred_cluster_enabled();
 	u64 wallclock;
 	bool prev_skip_min = grp->skip_min;
 
@@ -2750,7 +2752,7 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 		return;
 
 	list_for_each_entry(p, &grp->tasks, grp_list) {
-		if (task_boost_policy(p) == SCHED_BOOST_ON_BIG) {
+		if (check_boost && task_boost_policy(p) == SCHED_BOOST_ON_BIG) {
 			group_boost = true;
 			break;
 		}
@@ -2760,6 +2762,10 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 			continue;
 
 		combined_demand += p->ravg.coloc_demand;
+		/* With no ON_BIG boost, later members cannot undo upmigration. */
+		if (!check_boost && !trace &&
+		    combined_demand > sched_group_upmigrate)
+			break;
 	}
 
 	grp->last_update = wallclock;
@@ -2775,6 +2781,13 @@ out:
 
 void set_preferred_cluster(struct related_thread_group *grp)
 {
+	u64 wallclock = sched_ktime_clock();
+
+	/* Membership changes use the locked helper and bypass this shortcut. */
+	if (wallclock - READ_ONCE(grp->last_update) <
+	    READ_ONCE(sched_ravg_window) / 10)
+		return;
+
 	raw_spin_lock(&grp->lock);
 	_set_preferred_cluster(grp);
 	raw_spin_unlock(&grp->lock);

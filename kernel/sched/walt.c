@@ -36,6 +36,7 @@ static u64 walt_load_reported_window;
 
 static struct irq_work walt_cpufreq_irq_work;
 static struct irq_work walt_migration_irq_work;
+static atomic_t walt_migration_pending = ATOMIC_INIT(0);
 
 u64 sched_ktime_clock(void)
 {
@@ -204,6 +205,10 @@ __read_mostly unsigned int walt_scale_demand_divisor;
 
 static inline void walt_irq_work_queue(struct irq_work *work)
 {
+	/* Publish before irq_work_claim() can observe an already pending job. */
+	if (work == &walt_migration_irq_work)
+		atomic_xchg(&walt_migration_pending, 1);
+
 	if (likely(cpu_online(raw_smp_processor_id())))
 		irq_work_queue(work);
 	else
@@ -3333,6 +3338,7 @@ void walt_irq_work(struct irq_work *irq_work)
 	int cpu;
 	u64 wc;
 	bool is_migration = false, is_asym_migration = false;
+	bool migration_pending;
 	u64 total_grp_load = 0, min_cluster_grp_load = 0;
 	unsigned long flags, flag;
 
@@ -3340,7 +3346,19 @@ void walt_irq_work(struct irq_work *irq_work)
 	if (irq_work == &walt_migration_irq_work)
 		is_migration = true;
 
+	/* A window report may already have consumed this notification. */
+	if (is_migration && !atomic_read(&walt_migration_pending))
+		return;
+
 	acquire_rq_locks_irqsave(cpu_possible_mask, &flag);
+
+	/*
+	 * Either report can consume migrations already published under rq
+	 * locks. Producers after this snapshot queue another notification.
+	 */
+	migration_pending = atomic_xchg(&walt_migration_pending, 0);
+	if (is_migration && !migration_pending)
+		goto unlock;
 
 	wc = sched_ktime_clock();
 	walt_load_reported_window = atomic64_read(&walt_irq_work_lastq_ws);
@@ -3357,7 +3375,7 @@ void walt_irq_work(struct irq_work *irq_work)
 				account_load_subtractions(rq);
 				aggr_grp_load += rq->grp_time.prev_runnable_sum;
 			}
-			if (is_migration && rq->notif_pending &&
+			if (migration_pending && rq->notif_pending &&
 			    cpumask_test_cpu(cpu, &asym_cap_sibling_cpus)) {
 				is_asym_migration = true;
 				rq->notif_pending = false;
@@ -3401,7 +3419,7 @@ void walt_irq_work(struct irq_work *irq_work)
 
 			rq = cpu_rq(cpu);
 
-			if (is_migration) {
+			if (migration_pending) {
 				if (rq->notif_pending) {
 					flag |= SCHED_CPUFREQ_INTERCLUSTER_MIG;
 					rq->notif_pending = false;
@@ -3448,6 +3466,7 @@ void walt_irq_work(struct irq_work *irq_work)
 		raw_spin_unlock_irqrestore(&sched_ravg_window_lock, flags);
 	}
 
+unlock:
 	release_rq_locks_irqrestore(cpu_possible_mask, &flag);
 
 	if (!is_migration)
@@ -3652,7 +3671,7 @@ int walt_proc_user_hint_handler(struct ctl_table *table,
 	if (ret || !write || (old_value == sysctl_sched_user_hint))
 		goto unlock;
 
-	irq_work_queue(&walt_migration_irq_work);
+	walt_irq_work_queue(&walt_migration_irq_work);
 
 unlock:
 	mutex_unlock(&mutex);

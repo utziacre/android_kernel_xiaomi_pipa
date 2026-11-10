@@ -12045,9 +12045,12 @@ static int active_load_balance_cpu_stop(void *data)
 	target_cpu = busiest_rq->push_cpu;
 	if (push_task) {
 		if (task_on_rq_queued(push_task) &&
+			push_task->sched_class == &fair_sched_class &&
 			push_task->state == TASK_RUNNING &&
 			task_cpu(push_task) == busiest_cpu &&
-					cpu_online(target_cpu)) {
+			!__migrate_disabled(push_task) &&
+			cpumask_test_cpu(target_cpu, push_task->cpus_ptr) &&
+			!cpu_isolated(target_cpu)) {
 			update_rq_clock(busiest_rq);
 			detach_task(push_task, &env);
 			push_task_detached = 1;
@@ -13776,7 +13779,13 @@ kick_active_balance(struct rq *rq, struct task_struct *p, int new_cpu)
 
 	/* Invoke active balance to force migrate currently running task */
 	raw_spin_lock_irqsave(&rq->lock, flags);
-	if (!rq->active_balance) {
+	if (!rq->active_balance && rq->curr == p &&
+	    p->sched_class == &fair_sched_class &&
+	    p->state == TASK_RUNNING && task_on_rq_queued(p) &&
+	    !__migrate_disabled(p) && p->nr_cpus_allowed > 1 &&
+	    cpumask_test_cpu(new_cpu, p->cpus_ptr) &&
+	    cpu_active(cpu_of(rq)) && cpu_active(new_cpu) &&
+	    !cpu_isolated(new_cpu)) {
 		rq->active_balance = 1;
 		rq->push_cpu = new_cpu;
 		get_task_struct(p);
@@ -13944,17 +13953,22 @@ void check_for_migration(struct rq *rq, struct task_struct *p)
 	int ret;
 
 	if (rq->misfit_task_load) {
-		if (rq->curr->state != TASK_RUNNING ||
+		if (READ_ONCE(rq->active_balance) ||
+		    rq->curr->state != TASK_RUNNING ||
 		    rq->curr->nr_cpus_allowed == 1)
 			return;
 
 		if (task_will_be_throttled(p))
 			return;
 
-		raw_spin_lock(&migration_lock);
 		rcu_read_lock();
 		new_cpu = find_energy_efficient_cpu(p, prev_cpu, 0, 1);
 		rcu_read_unlock();
+
+		/* Selection is speculative; serialize only request publication. */
+		if (!raw_spin_trylock(&migration_lock))
+			return;
+
 		if ((new_cpu != -1) && (new_cpu != prev_cpu) &&
 		    (capacity_orig_of(new_cpu) > capacity_orig_of(prev_cpu))) {
 			active_balance = kick_active_balance(rq, p, new_cpu);
@@ -13964,10 +13978,19 @@ void check_for_migration(struct rq *rq, struct task_struct *p)
 				ret = stop_one_cpu_nowait(prev_cpu,
 					active_load_balance_cpu_stop, rq,
 					&rq->active_balance_work);
-				if (!ret)
+				if (!ret) {
+					unsigned long flags;
+
+					/* No stopper owns the task reference. */
+					raw_spin_lock_irqsave(&rq->lock, flags);
+					rq->active_balance = 0;
+					rq->push_task = NULL;
+					raw_spin_unlock_irqrestore(&rq->lock, flags);
 					clear_reserved(new_cpu);
-				else
+					put_task_struct(p);
+				} else {
 					wake_up_if_idle(new_cpu);
+				}
 				return;
 			}
 		} else {

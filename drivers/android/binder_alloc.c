@@ -226,7 +226,7 @@ static int binder_install_pages(struct binder_alloc *alloc,
 {
 	struct page *page_onstack[BINDER_INSTALL_STACK_PAGES];
 	struct page **pages = page_onstack;
-	size_t num_pages = (final - start) / PAGE_SIZE;
+	size_t num_pages;
 	unsigned long page_addr;
 	size_t i;
 	bool mm_locked = false;
@@ -242,6 +242,10 @@ static int binder_install_pages(struct binder_alloc *alloc,
 	}
 	if (page_addr >= final)
 		return 0;
+
+	/* Installed pages in this allocated buffer cannot be reclaimed. */
+	start = page_addr;
+	num_pages = (final - start) / PAGE_SIZE;
 
 	if (num_pages > BINDER_INSTALL_STACK_PAGES) {
 		pages = kcalloc(num_pages, sizeof(*pages), GFP_KERNEL);

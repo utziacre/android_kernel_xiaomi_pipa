@@ -2034,6 +2034,8 @@ static int find_lowest_rq(struct task_struct *task)
 	return -1;
 }
 
+static struct task_struct *pick_next_pushable_task(struct rq *rq);
+
 /* Will lock the rq it finds */
 static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 {
@@ -2064,15 +2066,15 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 			/*
 			 * We had to unlock the run queue. In
 			 * the mean time, task could have
-			 * migrated already or had its affinity changed.
-			 * Also make sure that it wasn't scheduled on its rq.
+			 * migrated already or had its affinity changed, so check
+			 * membership and ordering under the source rq lock.
+			 * Separate task_rq()/on_rq reads can observe different
+			 * incarnations of a task that slept and woke elsewhere.
+			 * It could also have run and become migration disabled.
 			 */
-			if (unlikely(task_rq(task) != rq ||
+			if (unlikely(__migrate_disabled(task) ||
 				     !cpumask_test_cpu(lowest_rq->cpu, task->cpus_ptr) ||
-				     task_running(rq, task) ||
-				     !rt_task(task) ||
-				     __migrate_disabled(task) ||
-				     !task_on_rq_queued(task))) {
+				     task != pick_next_pushable_task(rq))) {
 
 				double_unlock_balance(rq, lowest_rq);
 				lowest_rq = NULL;

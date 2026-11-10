@@ -34,6 +34,7 @@ struct binder_transaction;
  * @data_size:          size of @transaction data
  * @offsets_size:       size of array of offsets
  * @extra_buffers_size: size of space for other objects (like sg lists)
+ * @size:               total size, immutable while the buffer is allocated
  * @user_data:          user pointer to base of buffer space
  * @pid:                pid to attribute the buffer to (caller)
  *
@@ -54,6 +55,7 @@ struct binder_buffer {
 	size_t data_size;
 	size_t offsets_size;
 	size_t extra_buffers_size;
+	size_t size;
 	void __user *user_data;
 	int pid;
 };

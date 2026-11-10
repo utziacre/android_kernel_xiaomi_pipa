@@ -58,6 +58,7 @@ static struct binder_buffer *binder_buffer_prev(struct binder_buffer *buffer)
 	return list_entry(buffer->entry.prev, struct binder_buffer, entry);
 }
 
+/* Caller must serialize buffer-list changes. */
 static size_t binder_alloc_buffer_size(struct binder_alloc *alloc,
 				       struct binder_buffer *buffer)
 {
@@ -601,6 +602,7 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 				min(next_used_page, curr_last_page));
 
 	rb_erase(&buffer->rb_node, &alloc->free_buffers);
+	buffer->size = size;
 	buffer->free = 0;
 	buffer->allow_user_free = 0;
 	binder_insert_allocated_buffer_locked(alloc, buffer);
@@ -847,7 +849,7 @@ static struct page *binder_alloc_get_page(struct binder_alloc *alloc,
 static void binder_alloc_clear_buf(struct binder_alloc *alloc,
 				   struct binder_buffer *buffer)
 {
-	size_t bytes = binder_alloc_buffer_size(alloc, buffer);
+	size_t bytes = buffer->size;
 	binder_size_t buffer_offset = 0;
 
 	while (bytes) {
@@ -1281,11 +1283,10 @@ void binder_alloc_shrinker_exit(void)
  *
  * Return: true if the buffer is safe to access
  */
-static inline bool check_buffer(struct binder_alloc *alloc,
-				struct binder_buffer *buffer,
+static inline bool check_buffer(struct binder_buffer *buffer,
 				binder_size_t offset, size_t bytes)
 {
-	size_t buffer_size = binder_alloc_buffer_size(alloc, buffer);
+	size_t buffer_size = buffer->size;
 
 	return buffer_size >= bytes &&
 		offset <= buffer_size - bytes &&
@@ -1313,7 +1314,7 @@ binder_alloc_copy_user_to_buffer(struct binder_alloc *alloc,
 				 const void __user *from,
 				 size_t bytes)
 {
-	if (!check_buffer(alloc, buffer, buffer_offset, bytes))
+	if (!check_buffer(buffer, buffer_offset, bytes))
 		return bytes;
 
 	while (bytes) {
@@ -1346,7 +1347,7 @@ static int binder_alloc_do_buffer_copy(struct binder_alloc *alloc,
 				       size_t bytes)
 {
 	/* All copies must be 32-bit aligned and 32-bit size */
-	if (!check_buffer(alloc, buffer, buffer_offset, bytes))
+	if (!check_buffer(buffer, buffer_offset, bytes))
 		return -EINVAL;
 
 	while (bytes) {

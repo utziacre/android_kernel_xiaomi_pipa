@@ -2957,8 +2957,8 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 
 #ifdef CONFIG_SMP
 #ifdef CONFIG_SCHED_WALT
-/* utility function to update walt signals at wakeup */
-static inline void walt_try_to_wake_up(struct task_struct *p)
+/* Update WALT signals; return true if the wakeup was also completed. */
+static inline bool walt_try_to_wake_up(struct task_struct *p, int wake_flags)
 {
 	struct rq *rq = cpu_rq(task_cpu(p));
 	struct rq_flags rf;
@@ -2972,6 +2972,23 @@ static inline void walt_try_to_wake_up(struct task_struct *p)
 	update_task_ravg(rq->curr, rq, TASK_UPDATE, wallclock, 0);
 	update_task_ravg(p, rq, TASK_WAKE, wallclock, 0);
 	note_task_waking(p, wallclock);
+
+	/*
+	 * A single-CPU, ungrouped task needs no placement or group update.
+	 * Reuse the statistics lock for activation instead of dropping it
+	 * and taking the same rq lock again in ttwu_queue(). Leave queued
+	 * wakeups and hotplug/isolation fallback handling on the slow path.
+	 */
+	if (!sched_feat(TTWU_QUEUE) && p->nr_cpus_allowed == 1 &&
+	    cpumask_test_cpu(cpu_of(rq), p->cpus_ptr) &&
+	    cpu_active(cpu_of(rq)) && !cpu_isolated(cpu_of(rq)) &&
+	    !rcu_access_pointer(p->grp)) {
+		update_rq_clock(rq);
+		ttwu_do_activate(rq, p, wake_flags, &rf);
+		rq_unlock_irqrestore(rq, &rf);
+		return true;
+	}
+
 	rq_unlock_irqrestore(rq, &rf);
 
 	rcu_read_lock();
@@ -2979,9 +2996,13 @@ static inline void walt_try_to_wake_up(struct task_struct *p)
 	if (update_preferred_cluster(grp, p, old_load, false))
 		set_preferred_cluster(grp);
 	rcu_read_unlock();
+	return false;
 }
 #else
-#define walt_try_to_wake_up(a) {}
+static inline bool walt_try_to_wake_up(struct task_struct *p, int wake_flags)
+{
+	return false;
+}
 #endif
 #endif
 
@@ -3168,7 +3189,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
 	 */
 	smp_cond_load_acquire(&p->on_cpu, !VAL);
 
-	walt_try_to_wake_up(p);
+	if (walt_try_to_wake_up(p, wake_flags))
+		goto unlock;
 
 	cpu = select_task_rq(p, p->wake_cpu, SD_BALANCE_WAKE, wake_flags,
 			     sibling_count_hint);

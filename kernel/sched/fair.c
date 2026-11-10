@@ -3657,6 +3657,10 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 		se->rel_deadline = 0;
 		se->vruntime = avruntime - se->vlag;
 
+		/* Moving vruntime must not revive expired slice protection. */
+		if (curr && !rel_vprot)
+			se->vprot = se->vruntime;
+
 		if (!curr)
 			__enqueue_entity(cfs_rq, se);
 	}

@@ -724,7 +724,8 @@ static unsigned long prev_buffer_end_page(struct binder_buffer *buffer)
 }
 
 static void binder_delete_free_buffer(struct binder_alloc *alloc,
-				      struct binder_buffer *buffer)
+				      struct binder_buffer *buffer,
+				      struct list_head *buffers_to_free)
 {
 	struct binder_buffer *prev, *next;
 
@@ -746,12 +747,12 @@ static void binder_delete_free_buffer(struct binder_alloc *alloc,
 	binder_lru_freelist_add(alloc, buffer_start_page(buffer),
 				buffer_start_page(buffer) + PAGE_SIZE);
 skip_freelist:
-	list_del(&buffer->entry);
-	kfree(buffer);
+	list_move_tail(&buffer->entry, buffers_to_free);
 }
 
 static void binder_free_buf_locked(struct binder_alloc *alloc,
-				   struct binder_buffer *buffer)
+				   struct binder_buffer *buffer,
+				   struct list_head *buffers_to_free)
 {
 	size_t size, buffer_size;
 
@@ -788,19 +789,33 @@ static void binder_free_buf_locked(struct binder_alloc *alloc,
 
 		if (next->free) {
 			rb_erase(&next->rb_node, &alloc->free_buffers);
-			binder_delete_free_buffer(alloc, next);
+			binder_delete_free_buffer(alloc, next, buffers_to_free);
 		}
 	}
 	if (alloc->buffers.next != &buffer->entry) {
 		struct binder_buffer *prev = binder_buffer_prev(buffer);
 
 		if (prev->free) {
-			binder_delete_free_buffer(alloc, buffer);
+			binder_delete_free_buffer(alloc, buffer, buffers_to_free);
 			rb_erase(&prev->rb_node, &alloc->free_buffers);
 			buffer = prev;
 		}
 	}
 	binder_insert_free_buffer(alloc, buffer);
+}
+
+static void binder_free_buffer_list(struct list_head *buffers)
+{
+	struct binder_buffer *buffer, *tmp;
+	unsigned int nr_freed = 0;
+
+	list_for_each_entry_safe(buffer, tmp, buffers, entry) {
+		list_del(&buffer->entry);
+		kfree(buffer);
+		/* Process teardown can retire many descriptors at once. */
+		if (!(++nr_freed & 63))
+			cond_resched();
+	}
 }
 
 /**
@@ -879,6 +894,8 @@ static void binder_alloc_clear_buf(struct binder_alloc *alloc,
 void binder_alloc_free_buf(struct binder_alloc *alloc,
 			    struct binder_buffer *buffer)
 {
+	LIST_HEAD(buffers_to_free);
+
 	/*
 	 * We could eliminate the call to binder_alloc_clear_buf()
 	 * from binder_alloc_deferred_release() by moving this to
@@ -892,8 +909,9 @@ void binder_alloc_free_buf(struct binder_alloc *alloc,
 		buffer->clear_on_free = false;
 	}
 	binder_alloc_lock(alloc);
-	binder_free_buf_locked(alloc, buffer);
+	binder_free_buf_locked(alloc, buffer, &buffers_to_free);
 	binder_alloc_unlock(alloc);
+	binder_free_buffer_list(&buffers_to_free);
 }
 
 /**
@@ -981,6 +999,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 	struct rb_node *n;
 	int buffers, page_count;
 	struct binder_buffer *buffer;
+	LIST_HEAD(buffers_to_free);
 
 	buffers = 0;
 	binder_alloc_lock(alloc);
@@ -996,7 +1015,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 			binder_alloc_clear_buf(alloc, buffer);
 			buffer->clear_on_free = false;
 		}
-		binder_free_buf_locked(alloc, buffer);
+		binder_free_buf_locked(alloc, buffer, &buffers_to_free);
 		buffers++;
 	}
 
@@ -1005,10 +1024,10 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 					  struct binder_buffer, entry);
 		WARN_ON(!buffer->free);
 
-		list_del(&buffer->entry);
+		list_move_tail(&buffer->entry, &buffers_to_free);
 		WARN_ON_ONCE(!list_empty(&alloc->buffers));
-		kfree(buffer);
 	}
+	alloc->free_buffers = RB_ROOT;
 
 	page_count = 0;
 	if (alloc->pages) {
@@ -1033,6 +1052,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 		}
 	}
 	binder_alloc_unlock(alloc);
+	binder_free_buffer_list(&buffers_to_free);
 	kfree(alloc->pages);
 	if (alloc->vma_vm_mm)
 		mmdrop(alloc->vma_vm_mm);

@@ -524,10 +524,10 @@ static bool debug_low_async_space_locked(struct binder_alloc *alloc)
 	return false;
 }
 
-/* Callers preallocate @new_buffer, it is freed by this function if unused */
+/* Consume *@new_buffer only when splitting; callers free any unused buffer. */
 static struct binder_buffer *binder_alloc_new_buf_locked(
 				struct binder_alloc *alloc,
-				struct binder_buffer *new_buffer,
+				struct binder_buffer **new_buffer,
 				size_t size,
 				int is_async)
 {
@@ -574,16 +574,18 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 	}
 
 	if (buffer_size != size) {
+		struct binder_buffer *split = *new_buffer;
+
 		/* Found an oversized buffer and needs to be split */
 		buffer = rb_entry(best_fit, struct binder_buffer, rb_node);
 		buffer_size = binder_alloc_buffer_size(alloc, buffer);
 
 		WARN_ON(n || buffer_size == size);
-		new_buffer->user_data = buffer->user_data + size;
-		list_add(&new_buffer->entry, &buffer->entry);
-		new_buffer->free = 1;
-		binder_insert_free_buffer(alloc, new_buffer);
-		new_buffer = NULL;
+		split->user_data = buffer->user_data + size;
+		list_add(&split->entry, &buffer->entry);
+		split->free = 1;
+		binder_insert_free_buffer(alloc, split);
+		*new_buffer = NULL;
 	}
 
 	binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
@@ -619,8 +621,6 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 	}
 
 out:
-	/* Discard possibly unused new_buffer */
-	kfree(new_buffer);
 	return buffer;
 }
 
@@ -694,23 +694,22 @@ struct binder_buffer *binder_alloc_new_buf(struct binder_alloc *alloc,
 		return ERR_PTR(-ENOMEM);
 
 	binder_alloc_lock(alloc);
-	buffer = binder_alloc_new_buf_locked(alloc, next, size, is_async);
-	if (IS_ERR(buffer)) {
-		binder_alloc_unlock(alloc);
-		goto out;
+	buffer = binder_alloc_new_buf_locked(alloc, &next, size, is_async);
+	if (!IS_ERR(buffer)) {
+		buffer->data_size = data_size;
+		buffer->offsets_size = offsets_size;
+		buffer->extra_buffers_size = extra_buffers_size;
 	}
-
-	buffer->data_size = data_size;
-	buffer->offsets_size = offsets_size;
-	buffer->extra_buffers_size = extra_buffers_size;
 	binder_alloc_unlock(alloc);
+	kfree(next);
+	if (IS_ERR(buffer))
+		return buffer;
 
 	ret = binder_install_buffer_pages(alloc, buffer, size);
 	if (ret) {
 		binder_alloc_free_buf(alloc, buffer);
 		buffer = ERR_PTR(ret);
 	}
-out:
 	return buffer;
 }
 

@@ -9122,7 +9122,8 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		set_next_buddy(pse);
 
 	granularity = READ_ONCE(sysctl_sched_wakeup_preempt_gran);
-	if (granularity) {
+	/* Short slices must reach the EEVDF eligibility/deadline checks. */
+	if (granularity && !preempt_short) {
 		if (wakeup_preempt_entity(se, pse, granularity) == 1)
 			goto preempt;
 

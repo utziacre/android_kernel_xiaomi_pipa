@@ -2614,16 +2614,6 @@ prio_changed_rt(struct rq *rq, struct task_struct *p, int oldprio)
 #endif /* CONFIG_SMP */
 	} else {
 		/*
-		 * The task is queued but not running, so it is sorted into
-		 * rq->rt.pushable_tasks by its old priority. A priority change
-		 * (PI boost) has to be reflected there as well, otherwise the
-		 * push logic keeps treating it as a low priority task and it can
-		 * be starved behind other pushable tasks.
-		 */
-		if (p->nr_cpus_allowed > 1)
-			enqueue_pushable_task(rq, p);
-
-		/*
 		 * This task is not running, but if it is
 		 * greater than the current running task
 		 * then reschedule.

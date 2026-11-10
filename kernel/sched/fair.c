@@ -4925,20 +4925,29 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	/*
 	 * Preserve Qualcomm's WALT placement boosts for important tasks.
 	 * This intentionally lowers the entity's vruntime (and as a result
-	 * its deadline) so that it gets picked sooner.
+	 * its deadline) so that it gets picked sooner. Only a real wakeup
+	 * earns new credit; migration and other runnable requeues preserve
+	 * the lag/deadline already accounted for above.
 	 */
-	if (!(flags & ENQUEUE_INITIAL) && entity_is_task(se)) {
+	if ((flags & ENQUEUE_WAKEUP) && !(flags & ENQUEUE_INITIAL) &&
+	    entity_is_task(se)) {
 		struct task_struct *p = task_of(se);
 
 		if (per_task_boost(p) == TASK_BOOST_STRICT_MAX ||
 		    walt_low_latency_task(p) ||
 		    task_rtg_high_prio(p)) {
 			unsigned long thresh = sysctl_sched_latency;
+			u64 bonus, earliest;
 
 			if (sched_feat(GENTLE_FAIR_SLEEPERS))
 				thresh >>= 1;
 
-			se->vruntime -= sysctl_sched_latency + thresh;
+			bonus = (u64)sysctl_sched_latency + thresh;
+			earliest = vruntime - bonus;
+			/* Do not stack the bonus on top of existing positive lag. */
+			if ((s64)(se->vruntime - earliest) > 0)
+				se->vruntime = max_vruntime(se->vruntime - bonus,
+							    earliest);
 		}
 	}
 #endif

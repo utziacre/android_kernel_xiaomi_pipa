@@ -1142,7 +1142,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	 * We can safely skip eligibility check if there is only one entity
 	 * in this cfs_rq, saving some cycles.
 	 */
-	if (cfs_rq->h_nr_running == 1)
+	if (cfs_rq->nr_running == 1)
 		return curr && curr->on_rq ? curr : se;
 
 	/*
@@ -1529,7 +1529,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
 
-	if (cfs_rq->h_nr_running == 1)
+	if (cfs_rq->nr_running == 1)
 		return;
 
 	if (resched || !protect_slice(curr)) {

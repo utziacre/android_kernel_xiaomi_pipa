@@ -7563,13 +7563,14 @@ static inline int select_idle_sibling_cstate_aware(struct task_struct *p,
 {
 	struct sched_domain *sd;
 	struct sched_group *sg;
+	unsigned long util = uclamp_task(p);
+	unsigned long best_idle_capacity = ULONG_MAX;
 	int best_idle_cpu = -1;
-	int best_idle_cstate = -1;
-	int best_idle_capacity = INT_MAX;
+	int best_idle_cstate = INT_MAX;
 	int i;
 
 	/*
-	 * Iterate the domains and find an elegible idle cpu.
+	 * Iterate the domains and find an eligible idle CPU.
 	 */
 	sd = rcu_dereference(per_cpu(sd_llc, target));
 	for_each_lower_domain(sd) {
@@ -7581,33 +7582,33 @@ static inline int select_idle_sibling_cstate_aware(struct task_struct *p,
 
 			for_each_cpu_and(i, p->cpus_ptr,
 					  sched_group_span(sg)) {
-				int idle_idx = -1;
-				unsigned long new_usage;
+				int idle_idx;
 				unsigned long capacity_orig;
 
+				if (!cpu_active(i) || cpu_isolated(i))
+					continue;
+
 				if (!(available_idle_cpu(i) || sched_idle_cpu(i)))
-					goto next;
+					continue;
 
 				/* figure out if the task can fit here at all */
-				new_usage = uclamp_task(p);
 				capacity_orig = capacity_orig_of(i);
 
-				if (new_usage > capacity_orig)
-					goto next;
+				if (util > capacity_orig)
+					continue;
 
 				/* if the task fits without changing OPP and we
 				 * intended to use this CPU, just proceed
 				 */
 				if (i == target &&
-				    new_usage <= capacity_curr_of(target)) {
+				    util <= capacity_curr_of(target)) {
 					return target;
 				}
 
 				/* otherwise select CPU with shallowest idle
 				 * state to reduce wakeup latency.
 				 */
-				if (available_idle_cpu(i) || sched_idle_cpu(i))
-					idle_idx = idle_get_state_idx(cpu_rq(i));
+				idle_idx = idle_get_state_idx(cpu_rq(i));
 
 				if (idle_idx < best_idle_cstate &&
 				    capacity_orig <= best_idle_capacity) {

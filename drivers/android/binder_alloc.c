@@ -588,6 +588,7 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 	buffer->allow_user_free = 0;
 	binder_insert_allocated_buffer_locked(alloc, buffer);
 	buffer->async_transaction = is_async;
+	buffer->pid = current->tgid;
 	buffer->oneway_spam_suspect = false;
 	if (is_async) {
 		alloc->free_async_space -= size;
@@ -683,7 +684,6 @@ struct binder_buffer *binder_alloc_new_buf(struct binder_alloc *alloc,
 	buffer->data_size = data_size;
 	buffer->offsets_size = offsets_size;
 	buffer->extra_buffers_size = extra_buffers_size;
-	buffer->pid = current->tgid;
 	binder_alloc_unlock(alloc);
 
 	ret = binder_install_buffer_pages(alloc, buffer, size);

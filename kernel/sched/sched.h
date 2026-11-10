@@ -1076,7 +1076,7 @@ struct rq {
 	struct load_subtractions load_subs[NUM_TRACKED_WINDOWS];
 	DECLARE_BITMAP_ARRAY(top_tasks_bitmap,
 			NUM_TRACKED_WINDOWS, NUM_LOAD_INDICES);
-	u8			*top_tasks[NUM_TRACKED_WINDOWS];
+	u32			*top_tasks[NUM_TRACKED_WINDOWS];
 	u8			curr_table;
 	int			prev_top;
 	int			curr_top;

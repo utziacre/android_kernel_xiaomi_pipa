@@ -232,9 +232,9 @@ static inline bool is_new_task(struct task_struct *p)
 	return p->ravg.active_time < NEW_TASK_ACTIVE_TIME;
 }
 
-static inline void clear_top_tasks_table(u8 *table)
+static inline void clear_top_tasks_table(u32 *table)
 {
-	memset(table, 0, NUM_LOAD_INDICES * sizeof(u8));
+	memset(table, 0, NUM_LOAD_INDICES * sizeof(*table));
 }
 
 extern void update_cluster_load_subtractions(struct task_struct *p,

@@ -833,8 +833,8 @@ migrate_top_tasks(struct task_struct *p, struct rq *src_rq, struct rq *dst_rq)
 	u32 prev_window = p->ravg.prev_window;
 	u8 src = src_rq->curr_table;
 	u8 dst = dst_rq->curr_table;
-	u8 *src_table;
-	u8 *dst_table;
+	u32 *src_table;
+	u32 *dst_table;
 
 	if (curr_window) {
 		src_table = src_rq->top_tasks[src];
@@ -1249,8 +1249,8 @@ static void update_top_tasks(struct task_struct *p, struct rq *rq,
 {
 	u8 curr = rq->curr_table;
 	u8 prev = 1 - curr;
-	u8 *curr_table = rq->top_tasks[curr];
-	u8 *prev_table = rq->top_tasks[prev];
+	u32 *curr_table = rq->top_tasks[curr];
+	u32 *prev_table = rq->top_tasks[prev];
 	int old_index, new_index, update_index;
 	u32 curr_window = p->ravg.curr_window;
 	u32 prev_window = p->ravg.prev_window;
@@ -3639,7 +3639,7 @@ void walt_sched_init_rq(struct rq *rq)
 		memset(&rq->load_subs[j], 0,
 				sizeof(struct load_subtractions));
 		rq->top_tasks[j] = kcalloc(NUM_LOAD_INDICES,
-				sizeof(u8), GFP_NOWAIT);
+				sizeof(*rq->top_tasks[j]), GFP_NOWAIT);
 		/* No other choice */
 		BUG_ON(!rq->top_tasks[j]);
 		clear_top_tasks_bitmap(rq->top_tasks_bitmap[j]);

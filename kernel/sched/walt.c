@@ -2674,6 +2674,7 @@ void update_best_cluster(struct related_thread_group *grp,
 		 * will ensure tasks get to bigs
 		 */
 		grp->skip_min = false;
+		grp->downmigrate_ts = 0;
 		return;
 	}
 
@@ -2681,6 +2682,7 @@ void update_best_cluster(struct related_thread_group *grp,
 		demand = sched_group_upmigrate;
 
 	if (!grp->skip_min) {
+		grp->downmigrate_ts = 0;
 		if (demand >= sched_group_upmigrate) {
 			grp->skip_min = true;
 		}
@@ -2689,6 +2691,7 @@ void update_best_cluster(struct related_thread_group *grp,
 	if (demand < sched_group_downmigrate) {
 		if (!sysctl_sched_coloc_downmigrate_ns) {
 			grp->skip_min = false;
+			grp->downmigrate_ts = 0;
 			return;
 		}
 		if (!grp->downmigrate_ts) {
@@ -2728,13 +2731,10 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 	u64 wallclock;
 	bool prev_skip_min = grp->skip_min;
 
-	if (list_empty(&grp->tasks)) {
+	if (list_empty(&grp->tasks) || !hmp_capable()) {
 		grp->skip_min = false;
-		goto out;
-	}
-
-	if (!hmp_capable()) {
-		grp->skip_min = false;
+		grp->downmigrate_ts = 0;
+		grp->last_update = 0;
 		goto out;
 	}
 
@@ -2864,10 +2864,9 @@ static void remove_task_from_group(struct task_struct *p)
 	__task_rq_unlock(rq, &rf);
 
 
-	if (!list_empty(&grp->tasks)) {
+	if (!list_empty(&grp->tasks))
 		empty_group = 0;
-		_set_preferred_cluster(grp);
-	}
+	_set_preferred_cluster(grp);
 
 	raw_spin_unlock(&grp->lock);
 

@@ -429,6 +429,9 @@ static void debug_no_space_locked(struct binder_alloc *alloc)
 	size_t buffer_size;
 	struct rb_node *n;
 
+	if (!(READ_ONCE(binder_alloc_debug_mask) & BINDER_DEBUG_USER_ERROR))
+		return;
+
 	for (n = rb_first(&alloc->allocated_buffers); n; n = rb_next(n)) {
 		buffer = rb_entry(n, struct binder_buffer, rb_node);
 		buffer_size = binder_alloc_buffer_size(alloc, buffer);
@@ -468,6 +471,7 @@ static bool debug_low_async_space_locked(struct binder_alloc *alloc)
 	int pid = current->tgid;
 	size_t num_buffers = 0;
 	struct rb_node *n;
+	bool debug;
 
 	/*
 	 * Only start detecting spammers once we have less than 20% of async
@@ -478,6 +482,11 @@ static bool debug_low_async_space_locked(struct binder_alloc *alloc)
 		return false;
 	}
 
+	debug = READ_ONCE(binder_alloc_debug_mask) & BINDER_DEBUG_USER_ERROR;
+	/* A low-space episode only generates one notification. */
+	if (alloc->oneway_spam_detected && !debug)
+		return false;
+
 	for (n = rb_first(&alloc->allocated_buffers); n != NULL;
 		 n = rb_next(n)) {
 		buffer = rb_entry(n, struct binder_buffer, rb_node);
@@ -487,6 +496,10 @@ static bool debug_low_async_space_locked(struct binder_alloc *alloc)
 			continue;
 		total_alloc_size += binder_alloc_buffer_size(alloc, buffer);
 		num_buffers++;
+		/* Full totals are only needed for the diagnostic message. */
+		if (!debug && (num_buffers > 50 ||
+			       total_alloc_size > alloc->buffer_size / 4))
+			break;
 	}
 
 	/*

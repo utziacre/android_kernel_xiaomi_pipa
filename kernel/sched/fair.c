@@ -7434,6 +7434,12 @@ static inline int select_idle_smt(struct task_struct *p, struct sched_domain *sd
 
 #endif /* CONFIG_SCHED_SMT */
 
+static inline bool idle_cpu_usable(int cpu)
+{
+	return cpu_active(cpu) && !cpu_isolated(cpu) &&
+		(available_idle_cpu(cpu) || sched_idle_cpu(cpu));
+}
+
 /*
  * Scan the LLC domain for idle CPUs; this is dynamically regulated by
  * comparing the average scan cost (tracked in sd->avg_scan_cost) against the
@@ -7493,9 +7499,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 	for_each_cpu_wrap(cpu, cpus, target) {
 		if (!--nr)
 			return -1;
-		if (cpu_isolated(cpu))
-			continue;
-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
+		if (idle_cpu_usable(cpu))
 			break;
 	}
 	time = local_clock() - time;
@@ -7515,13 +7519,14 @@ static inline int __select_idle_sibling(struct task_struct *p, int prev,
 	struct sched_domain *sd;
 	int i, recent_used_cpu;
 
-	if ((available_idle_cpu(target) && !cpu_isolated(target)) || sched_idle_cpu(target))
+	if (cpumask_test_cpu(target, p->cpus_ptr) && idle_cpu_usable(target))
 		return target;
 
 	/*
 	 * If the previous CPU is cache affine and idle, don't be stupid:
 	 */
-	if ((prev != target && cpus_share_cache(prev, target) && available_idle_cpu(prev) && !cpu_isolated(prev)) || sched_idle_cpu(prev))
+	if (prev != target && cpus_share_cache(prev, target) &&
+	    cpumask_test_cpu(prev, p->cpus_ptr) && idle_cpu_usable(prev))
 		return prev;
 
 	/* Check a recently used CPU as a potential idle candidate: */
@@ -7529,8 +7534,8 @@ static inline int __select_idle_sibling(struct task_struct *p, int prev,
 	if (recent_used_cpu != prev &&
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
-            (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
-	    cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr)) {
+	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr) &&
+	    idle_cpu_usable(recent_used_cpu)) {
 		/*
 		 * Replace recent_used_cpu with prev as it is a potential
 		 * candidate for the next wake:

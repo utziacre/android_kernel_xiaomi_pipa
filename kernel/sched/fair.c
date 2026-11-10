@@ -7905,11 +7905,16 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	if (!start_sd)
 		goto out;
 
-	/* fast path for prev_cpu */
-	if (((capacity_orig_of(prev_cpu) == capacity_orig_of(start_cpu)) ||
-		asym_cap_siblings(prev_cpu, start_cpu)) &&
-		!cpu_isolated(prev_cpu) && cpu_online(prev_cpu) &&
-		(available_idle_cpu(prev_cpu) || sched_idle_cpu(prev_cpu))) {
+	/* Apply candidate restrictions before the cache-affine shortcut. */
+	if (cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    cpu_active(prev_cpu) && !cpu_isolated(prev_cpu) &&
+	    prev_cpu != fbt_env->skip_cpu &&
+	    !sched_cpu_high_irqload(prev_cpu) &&
+	    (available_idle_cpu(prev_cpu) || sched_idle_cpu(prev_cpu)) &&
+	    (capacity_orig_of(prev_cpu) == capacity_orig_of(start_cpu) ||
+	     asym_cap_siblings(prev_cpu, start_cpu)) &&
+	    min_util <= capacity_orig_of(prev_cpu) &&
+	    task_fits_max(p, prev_cpu)) {
 
 		if (idle_get_state_idx(cpu_rq(prev_cpu)) <= 1) {
 			target_cpu = prev_cpu;
@@ -7931,19 +7936,11 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 
 			trace_sched_cpu_util(i);
 
-			if (!cpu_online(i) || cpu_isolated(i))
+			if (!cpu_active(i) || cpu_isolated(i))
 				continue;
 
 			if (isolated_candidate == -1)
 				isolated_candidate = i;
-
-			/*
-			 * This CPU is the target of an active migration that's
-			 * yet to complete. Avoid placing another task on it.
-			 * See check_for_migration()
-			 */
-			if (is_reserved(i))
-				continue;
 
 			if (sched_cpu_high_irqload(i))
 				continue;

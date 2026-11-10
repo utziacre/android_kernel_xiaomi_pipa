@@ -89,7 +89,7 @@ int cpupri_find(struct cpupri *cp, struct task_struct *p,
 {
 	int idx = 0;
 	int task_pri = convert_prio(p->prio);
-	bool drop_nopreempts = task_pri <= MAX_RT_PRIO;
+	bool drop_nopreempts = lowest_mask && task_pri <= MAX_RT_PRIO;
 
 	BUG_ON(task_pri >= CPUPRI_NR_PRIORITIES);
 
@@ -97,6 +97,7 @@ retry:
 	for (idx = 0; idx < task_pri; idx++) {
 		struct cpupri_vec *vec  = &cp->pri_to_cpu[idx];
 		int skip = 0;
+		int cpu;
 
 		if (!atomic_read(&(vec)->count))
 			skip = 1;
@@ -124,52 +125,53 @@ retry:
 		if (skip)
 			continue;
 
+		if (!lowest_mask) {
+			/* Existence queries need a usable migration target too. */
+			for_each_cpu_and(cpu, p->cpus_ptr, vec->mask) {
+				if (cpu_active(cpu) && !cpu_isolated(cpu))
+					return 1;
+			}
+			continue;
+		}
+
 		if (cpumask_any_and(p->cpus_ptr, vec->mask) >= nr_cpu_ids)
 			continue;
 
-		if (lowest_mask) {
-			int cpu;
+		cpumask_and(lowest_mask, p->cpus_ptr, vec->mask);
+		cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
+		cpumask_andnot(lowest_mask, lowest_mask,
+			       cpu_isolated_mask);
+		if (drop_nopreempts)
+			drop_nopreempt_cpus(lowest_mask);
 
-			cpumask_and(lowest_mask, p->cpus_ptr, vec->mask);
-			cpumask_and(lowest_mask, lowest_mask, cpu_active_mask);
-			cpumask_andnot(lowest_mask, lowest_mask,
-				       cpu_isolated_mask);
-			if (drop_nopreempts)
-				drop_nopreempt_cpus(lowest_mask);
+		/*
+		 * Concurrent mask changes and CPU filtering can leave no targets
+		 * at this priority level.
+		 */
+		if (cpumask_empty(lowest_mask))
+			continue;
 
-			/*
-			 * We have to ensure that we have at least one bit
-			 * still set in the array, since the map could have
-			 * been concurrently emptied between the first and
-			 * second reads of vec->mask.  If we hit this
-			 * condition, simply act as though we never hit this
-			 * priority level and continue on.
-			 */
-			if (cpumask_empty(lowest_mask))
-				continue;
+		if (!fitness_fn)
+			return 1;
 
-			if (!fitness_fn)
-				return 1;
-
-			/* Ensure the capacity of the CPUs fit the task */
-			for_each_cpu(cpu, lowest_mask) {
-				if (!fitness_fn(p, cpu))
-					cpumask_clear_cpu(cpu, lowest_mask);
-			}
-
-			/*
-			 * If no CPU at the current priority can fit the task
-			 * continue looking
-			 */
-			if (cpumask_empty(lowest_mask))
-				continue;
+		/* Ensure the capacity of the CPUs fit the task */
+		for_each_cpu(cpu, lowest_mask) {
+			if (!fitness_fn(p, cpu))
+				cpumask_clear_cpu(cpu, lowest_mask);
 		}
+
+		/*
+		 * If no CPU at the current priority can fit the task
+		 * continue looking
+		 */
+		if (cpumask_empty(lowest_mask))
+			continue;
 
 		return 1;
 	}
 	/*
-	 * If we can't find any non-preemptible cpu's, retry so we can
-	 * find the lowest priority target and avoid priority inversion.
+	 * If every candidate may defer preemption, retry without that
+	 * preference to avoid priority inversion.
 	 */
 	if (drop_nopreempts) {
 		drop_nopreempts = false;

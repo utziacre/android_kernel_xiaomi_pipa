@@ -36,6 +36,10 @@
 
 #define EXITING_TASK_MARKER	0xdeaddead
 
+/* Keep sub-1024 task demand precise when aggregating large groups. */
+#define WALT_DEMAND_SHIFT	20
+#define WALT_DEMAND_SCALE	BIT(WALT_DEMAND_SHIFT)
+
 #define FREQ_REPORT_MAX_CPU_LOAD_TOP_TASK	0
 #define FREQ_REPORT_CPU_LOAD			1
 #define FREQ_REPORT_TOP_TASK			2

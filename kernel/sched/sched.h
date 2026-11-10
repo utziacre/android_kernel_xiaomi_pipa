@@ -2981,12 +2981,14 @@ static inline bool is_min_capacity_cpu(int cpu)
 
 static inline unsigned int task_load(struct task_struct *p)
 {
-	return p->ravg.demand;
+	return ((u64)READ_ONCE(p->ravg.demand_scaled) *
+		READ_ONCE(sched_ravg_window)) >> SCHED_CAPACITY_SHIFT;
 }
 
 static inline unsigned int task_pl(struct task_struct *p)
 {
-	return p->ravg.pred_demand;
+	return ((u64)READ_ONCE(p->ravg.pred_demand_scaled) *
+		READ_ONCE(sched_ravg_window)) >> SCHED_CAPACITY_SHIFT;
 }
 
 static inline bool task_in_related_thread_group(struct task_struct *p)

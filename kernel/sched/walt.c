@@ -121,6 +121,8 @@ __read_mostly unsigned int new_sched_ravg_window = DEFAULT_SCHED_RAVG_WINDOW;
 
 static DEFINE_RAW_SPINLOCK(sched_ravg_window_lock);
 u64 sched_ravg_window_change_time;
+static u64 sched_ravg_window_change_start;
+static u32 sched_ravg_window_seq;
 /*
  * A after-boot constant divisor for cpu_util_freq_walt() to apply the load
  * boost.
@@ -202,6 +204,46 @@ early_param("sched_predl", set_sched_predl);
 
 __read_mostly unsigned int walt_scale_demand_divisor;
 #define scale_demand(d) ((d)/walt_scale_demand_divisor)
+
+/* Caller holds an rq lock, which also serializes window-size changes. */
+static void rebase_task_demand(struct task_struct *p)
+{
+	struct ravg *ravg = &p->ravg;
+	u32 old_window = ravg->history_window_size;
+	u32 window = sched_ravg_window;
+	int i;
+
+	if (likely(ravg->window_seq == sched_ravg_window_seq &&
+		   old_window == window))
+		return;
+
+	if (is_idle_task(p) || exiting_task(p))
+		return;
+
+	if (old_window && old_window != window) {
+		for (i = 0; i < RAVG_HIST_SIZE_MAX; i++)
+			ravg->sum_history[i] = div64_u64((u64)ravg->sum_history[i] *
+						       window, old_window);
+		ravg->demand = div64_u64((u64)ravg->demand * window, old_window);
+		ravg->pred_demand = div64_u64((u64)ravg->pred_demand * window,
+					      old_window);
+		ravg->coloc_demand = div64_u64((u64)ravg->coloc_demand * window,
+					       old_window);
+	}
+
+	/*
+	 * A stale partial sample has no reliable duration after a resize.
+	 * Retain completed history instead of mixing that partial sample into
+	 * a different-sized window. Runtime already in the resized current
+	 * window remains valid and must not be scaled. CPU busy counters are
+	 * elapsed times and are deliberately left untouched.
+	 */
+	if (p->ravg.mark_start < sched_ravg_window_change_start)
+		ravg->sum = 0;
+
+	ravg->history_window_size = window;
+	ravg->window_seq = sched_ravg_window_seq;
+}
 
 static inline void walt_irq_work_queue(struct irq_work *work)
 {
@@ -1875,6 +1917,9 @@ static void update_history(struct rq *rq, struct task_struct *p,
 	p->ravg.demand = demand;
 	p->ravg.demand_scaled = demand_scaled;
 	p->ravg.coloc_demand = div64_u64(sum, sched_ravg_hist_size);
+	WRITE_ONCE(p->ravg.coloc_demand_scaled,
+		   div64_u64((u64)p->ravg.coloc_demand * WALT_DEMAND_SCALE,
+			     sched_ravg_window));
 	p->ravg.pred_demand = pred_demand;
 	p->ravg.pred_demand_scaled = pred_demand_scaled;
 
@@ -2108,6 +2153,7 @@ void update_task_ravg(struct task_struct *p, struct rq *rq, int event,
 	}
 
 	update_task_rq_cpu_cycles(p, rq, event, wallclock, irqtime);
+	rebase_task_demand(p);
 	update_task_demand(p, rq, event, wallclock);
 	update_cpu_busy_time(p, rq, event, wallclock, irqtime);
 	update_task_pred_demand(rq, p, event);
@@ -2145,8 +2191,8 @@ int sched_set_init_task_load(struct task_struct *p, int init_load_pct)
 void init_new_task_load(struct task_struct *p)
 {
 	int i;
-	u32 init_load_windows = sched_init_task_load_windows;
-	u32 init_load_windows_scaled = sched_init_task_load_windows_scaled;
+	u32 window = READ_ONCE(sched_ravg_window);
+	u32 init_load_windows, init_load_windows_scaled;
 	u32 init_load_pct = current->init_load_pct;
 
 	p->init_load_pct = 0;
@@ -2155,15 +2201,19 @@ void init_new_task_load(struct task_struct *p)
 	memset(&p->ravg, 0, sizeof(struct ravg));
 	p->cpu_cycles = 0;
 
-	if (init_load_pct) {
-		init_load_windows = div64_u64((u64)init_load_pct *
-			  (u64)sched_ravg_window, 100);
-		init_load_windows_scaled = scale_demand(init_load_windows);
-	}
+	if (!init_load_pct)
+		init_load_pct = READ_ONCE(sysctl_sched_init_task_load_pct);
+	init_load_windows = div64_u64((u64)init_load_pct * window, 100);
+	init_load_windows_scaled = init_load_windows /
+				   (window >> SCHED_CAPACITY_SHIFT);
 
 	p->ravg.demand = init_load_windows;
 	p->ravg.demand_scaled = init_load_windows_scaled;
 	p->ravg.coloc_demand = init_load_windows;
+	p->ravg.coloc_demand_scaled = div64_u64((u64)init_load_windows *
+					      WALT_DEMAND_SCALE, window);
+	p->ravg.history_window_size = window;
+	p->ravg.window_seq = READ_ONCE(sched_ravg_window_seq);
 	p->ravg.pred_demand = 0;
 	p->ravg.pred_demand_scaled = 0;
 	for (i = 0; i < RAVG_HIST_SIZE_MAX; ++i)
@@ -2213,7 +2263,7 @@ void mark_task_starting(struct task_struct *p)
 }
 
 #define pct_to_min_scaled(tunable) \
-		div64_u64(((u64)sched_ravg_window * tunable *		\
+		div64_u64(((u64)WALT_DEMAND_SCALE * tunable *		\
 			 topology_get_cpu_scale(NULL,			\
 			 cluster_first_cpu(sched_cluster[0]))),	\
 			 ((u64)SCHED_CAPACITY_SCALE * 100))
@@ -2651,9 +2701,10 @@ DEFINE_RAW_SPINLOCK(related_thread_group_lock);
 
 /*
  * Task groups whose aggregate demand on a cpu is more than
- * sched_group_upmigrate need to be up-migrated if possible.
+ * sched_group_upmigrate need to be up-migrated if possible. Thresholds
+ * use WALT_DEMAND_SCALE units, independent of the current window size.
  */
-unsigned int __read_mostly sched_group_upmigrate = 20000000;
+unsigned int __read_mostly sched_group_upmigrate = WALT_DEMAND_SCALE;
 unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 100;
 
 /*
@@ -2661,7 +2712,7 @@ unsigned int __read_mostly sysctl_sched_group_upmigrate_pct = 100;
  * demand to less than sched_group_downmigrate before they are "down"
  * migrated.
  */
-unsigned int __read_mostly sched_group_downmigrate = 19000000;
+unsigned int __read_mostly sched_group_downmigrate = WALT_DEMAND_SCALE * 95 / 100;
 unsigned int __read_mostly sysctl_sched_group_downmigrate_pct = 95;
 
 static inline
@@ -2761,7 +2812,7 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 		    (sched_ravg_window * sched_ravg_hist_size))
 			continue;
 
-		combined_demand += p->ravg.coloc_demand;
+		combined_demand += READ_ONCE(p->ravg.coloc_demand_scaled);
 		/* With no ON_BIG boost, later members cannot undo upmigration. */
 		if (!check_boost && !trace &&
 		    combined_demand > sched_group_upmigrate)
@@ -2770,7 +2821,12 @@ static void _set_preferred_cluster(struct related_thread_group *grp)
 
 	grp->last_update = wallclock;
 	update_best_cluster(grp, combined_demand, group_boost);
-	trace_sched_set_preferred_cluster(grp, combined_demand);
+	if (trace) {
+		combined_demand = mul_u64_u32_shr(combined_demand,
+						  READ_ONCE(sched_ravg_window),
+						  WALT_DEMAND_SHIFT);
+		trace_sched_set_preferred_cluster(grp, combined_demand);
+	}
 out:
 	if (grp->id == DEFAULT_CGROUP_COLOC_ID
 	    && grp->skip_min != prev_skip_min) {
@@ -3469,6 +3525,8 @@ void walt_irq_work(struct irq_work *irq_work)
 					new_sched_ravg_window,
 					sched_ravg_window_change_time);
 			sched_ravg_window = new_sched_ravg_window;
+			sched_ravg_window_change_start = this_rq()->window_start;
+			sched_ravg_window_seq++;
 			walt_tunables_fixup();
 		}
 		raw_spin_unlock_irqrestore(&sched_ravg_window_lock, flags);
@@ -3519,7 +3577,7 @@ void walt_fill_ta_data(struct core_ctl_notif_data *data)
 		    (sched_ravg_window * sched_ravg_hist_size))
 			continue;
 
-		total_demand += p->ravg.coloc_demand;
+		total_demand += READ_ONCE(p->ravg.coloc_demand_scaled);
 	}
 
 	raw_spin_unlock_irqrestore(&grp->lock, flags);
@@ -3528,7 +3586,7 @@ void walt_fill_ta_data(struct core_ctl_notif_data *data)
 	 * Scale the total demand to the lowest capacity CPU and
 	 * convert into percentage.
 	 *
-	 * P = total_demand/sched_ravg_window * 1024/scale * 100
+	 * P = total_demand/WALT_DEMAND_SCALE * 1024/scale * 100
 	 */
 
 	min_cap_cpu = this_rq()->rd->min_cap_orig_cpu;
@@ -3536,7 +3594,7 @@ void walt_fill_ta_data(struct core_ctl_notif_data *data)
 		scale = arch_scale_cpu_capacity(NULL, min_cap_cpu);
 
 	data->coloc_load_pct = div64_u64(total_demand * 1024 * 100,
-			       (u64)sched_ravg_window * scale);
+			       (u64)WALT_DEMAND_SCALE * scale);
 
 fill_util:
 	for_each_sched_cluster(cluster) {
